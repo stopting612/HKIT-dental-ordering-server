@@ -1,4 +1,5 @@
 # rules.py
+from material_normalizer import normalize_material, STANDARD_MATERIALS
 
 def validate_bridge_positions(params):
     """驗證牙橋牙位的連續性和跨度"""
@@ -63,30 +64,30 @@ def validate_bridge_positions(params):
 
 def validate_material_compatibility(params):
     """
-    驗證材料類型與修復類型的相容性（嚴格版本）
+    驗證材料類型與修復類型的相容性
     
-    材料分類系統：
-    1. 主類別 (Main Category): PFM, Metal-Free, Full Cast
-    2. 子類型 (Subtype): 具體材料，如 High Noble, IPS e.max, Titanium
+    支援兩種模式：
+    1. 驗證模式：提供 material_subtype，驗證是否可用
+    2. 查詢模式：不提供 material_subtype，返回可用的子類型列表
     """
     
     restoration_type = params.get('restoration_type', '').lower()
-    material_category = params.get('material_category', '').lower()  # PFM, Metal-Free, Full Cast
-    material_subtype = params.get('material_subtype', '').lower()    # 具體材料
+    material_category = params.get('material_category', '').lower()
+    material_subtype = params.get('material_subtype', '')
     bridge_span = params.get('bridge_span', 1)
     
     # === 參數驗證 ===
     if not restoration_type:
         return {
             'valid': False,
-            'message': 'Missing restoration type parameter',
+            'message': '缺少修復類型參數',
             'error_type': 'missing_parameter'
         }
     
     if not material_category:
         return {
             'valid': False,
-            'message': 'Missing material category parameter',
+            'message': '缺少材料類別參數',
             'error_type': 'missing_parameter'
         }
     
@@ -111,168 +112,104 @@ def validate_material_compatibility(params):
     
     normalized_category = category_map.get(material_category, material_category)
     
-    # === 子類型標準化 ===
-    subtype_map = {
-        # PFM 子類型
-        'high-noble': 'high-noble',
-        'high noble': 'high-noble',
-        'high-precious': 'high-noble',
-        'high precious': 'high-noble',
-        '高貴金屬': 'high-noble',
-        
-        'semi-precious': 'semi-precious',
-        'semi precious': 'semi-precious',
-        '半貴金屬': 'semi-precious',
-        
-        'non-precious': 'non-precious',
-        'non precious': 'non-precious',
-        'np': 'non-precious',
-        '非貴金屬': 'non-precious',
-        
-        'palladium': 'palladium',
-        'palladium-based': 'palladium',
-        'palladium based': 'palladium',
-        '鈀基': 'palladium',
-        
-        'titanium': 'titanium',
-        '鈦合金': 'titanium',
-        '鈦': 'titanium',
-        
-        # Metal-Free 子類型
-        'emax': 'emax',                    
-        'e.max': 'emax',                   
-        'ips-emax': 'emax',                
-        'ips e.max': 'emax',               
-        'ips emax': 'emax',                
-        
-        'fmz': 'fmz',
-        '全鋯': 'fmz',
-        
-        'fmz-ultra': 'fmz-ultra',
-        'fmz ultra': 'fmz-ultra',
-        '高透多層鋯': 'fmz-ultra',
-        
-        'lava': 'lava',
-        '3m lava': 'lava',
-        
-        'lava-plus': 'lava-plus',
-        'lava plus': 'lava-plus',
-        
-        'lava-esthetic': 'lava-esthetic',
-        'lava esthetic': 'lava-esthetic',
-        
-        'calypso': 'calypso',
-        
-        'composite': 'composite',
-        '複合樹脂': 'composite',
-        
-        'zineer': 'zineer',
-        
-        # Full Cast 子類型
-        'high-precious-gold': 'high-precious-gold',
-        'high precious gold': 'high-precious-gold',
-        'yellow-gold-high-precious': 'high-precious-gold',
-        '高貴黃金': 'high-precious-gold',
-        
-        'semi-precious-gold': 'semi-precious-gold',
-        'semi precious gold': 'semi-precious-gold',
-        'yellow-gold-semi-precious': 'semi-precious-gold',
-        '半貴黃金': 'semi-precious-gold',
-        
-        'low-precious-gold': 'low-precious-gold',
-        'low precious gold': 'low-precious-gold',
-        'yellow-gold-low-precious': 'low-precious-gold',
-        '低貴黃金': 'low-precious-gold',
-        
-        'white-gold': 'white-gold',
-        'white gold': 'white-gold',
-        '白金': 'white-gold',
-        
-        'pure-titanium': 'pure-titanium',
-        'pure titanium': 'pure-titanium',
-        '純鈦': 'pure-titanium'
-    }
-    normalized_subtype = subtype_map.get(material_subtype, material_subtype) if material_subtype else None
+    # === 使用智能標準化處理子類型 ===
+    if material_subtype:
+        normalized_subtype = normalize_material(
+            material_input=material_subtype,
+            material_category=normalized_category,
+            use_llm=True  # 啟用 LLM（可以改為 False 以節省成本）
+        )
+    else:
+        normalized_subtype = None
     
-
-
     # === 定義相容性規則 ===
     compatibility_rules = {
-    'crown': {
-        'pfm': {
-            'allowed_subtypes': ['high-precious', 'semi-precious', 'palladium-based', 'titanium', 'np'],
-            'reason': 'PFM Crown can use various metal subtypes'
+        'crown': {
+            'pfm': {
+                'allowed_subtypes': ['high-noble', 'semi-precious', 'non-precious', 'palladium', 'titanium'],
+                'forbidden_subtypes': [],
+                'reason': 'PFM Crown 可以使用各種金屬基底'
+            },
+            'metal-free': {
+                'allowed_subtypes': ['emax', 'fmz', 'fmz-ultra', 'lava', 'lava-plus', 'lava-esthetic', 'calypso', 'composite'],
+                'forbidden_subtypes': ['zineer'],
+                'reason': 'Metal-Free Crown 可以使用多種全瓷材料，但 Zineer 不適用'
+            },
+            'full-cast': {
+                'allowed_subtypes': ['high-precious-gold', 'semi-precious-gold', 'low-precious-gold', 'white-gold', 'pure-titanium', 'non-precious'],
+                'forbidden_subtypes': [],
+                'reason': 'Full Cast Crown 可以使用各種金屬'
+            }
         },
-        'metal-free': {
-            'allowed_subtypes': ['calypso', 'fmz-ultra', 'fmz', 'lava', 'lava-esthetic', 'lava-plus', 'emax', 'composite'],
-            'forbidden_subtypes': ['zineer'],
-            'reason': 'Metal-Free Crown can use various all-ceramic subtypes'
+        'bridge': {
+            'pfm': {
+                'allowed_subtypes': ['high-noble', 'semi-precious', 'non-precious', 'palladium', 'titanium'],
+                'forbidden_subtypes': [],
+                'reason': 'PFM Bridge 需要較強的金屬基底'
+            },
+            'metal-free': {
+                'allowed_subtypes': ['emax', 'fmz', 'fmz-ultra', 'lava', 'lava-plus', 'lava-esthetic', 'calypso'],
+                'forbidden_subtypes': ['composite', 'zineer'],
+                'reason': 'Metal-Free Bridge 只能使用高強度全瓷材料'
+            },
+            'full-cast': {
+                'allowed_subtypes': ['high-precious-gold', 'semi-precious-gold', 'white-gold', 'pure-titanium', 'non-precious'],
+                'forbidden_subtypes': [],
+                'reason': 'Full Cast Bridge 需要極高強度'
+            }
         },
-        'full-cast': {
-            'allowed_subtypes': ['yellow-gold-high-precious', 'yellow-gold-semi-precious', 'white-gold', 'yellow-gold-low-precious', 'np', 'titanium'],
-            #                     
-            'reason': 'Full Cast Crown can use various metal subtypes'
-        }
-    },
-    'bridge': {
-        'pfm': {
-            'allowed_subtypes': ['high-precious', 'semi-precious', 'palladium-based', 'titanium', 'np'],
-            'reason': 'PFM Bridge needs a strong metal base'
+        'veneer': {
+            'pfm': {
+                'allowed_subtypes': [],
+                'forbidden_subtypes': [],
+                'reason': 'Veneer 必須使用全瓷材料以確保透光性，不能使用 PFM'
+            },
+            'metal-free': {
+                'allowed_subtypes': ['emax', 'zineer', 'composite'],
+                'forbidden_subtypes': ['fmz', 'fmz-ultra', 'lava', 'lava-plus', 'lava-esthetic', 'calypso'],
+                'reason': 'Veneer 需要極佳透光性的全瓷材料，高強度鋯瓷不適用'
+            },
+            'full-cast': {
+                'allowed_subtypes': [],
+                'forbidden_subtypes': [],
+                'reason': 'Veneer 必須使用全瓷材料，不能使用金屬'
+            }
         },
-        'metal-free': {
-            'allowed_subtypes': ['calypso', 'fmz-ultra', 'fmz', 'lava', 'lava-esthetic', 'lava-plus', 'emax', 'composite'],
-            'forbidden_subtypes': ['zineer'],
-            'reason': 'Metal-Free Bridge can only use high-strength all-ceramic materials'
+        'inlay': {
+            'pfm': {
+                'allowed_subtypes': [],
+                'forbidden_subtypes': [],
+                'reason': 'Inlay 不適用 PFM'
+            },
+            'metal-free': {
+                'allowed_subtypes': ['emax', 'composite'],
+                'forbidden_subtypes': [],
+                'reason': 'Inlay 建議使用全瓷或複合樹脂'
+            },
+            'full-cast': {
+                'allowed_subtypes': ['high-precious-gold', 'semi-precious-gold', 'low-precious-gold', 'white-gold', 'pure-titanium', 'non-precious'],
+                'forbidden_subtypes': [],
+                'reason': 'Inlay 可使用全金屬'
+            }
         },
-        'full-cast': {
-            'allowed_subtypes': ['yellow-gold-high-precious', 'yellow-gold-semi-precious', 'white-gold', 'yellow-gold-low-precious', 'np', 'titanium'],
-            'reason': 'Full Cast Bridge is less commonly used and requires very high strength'
-        }
-    },
-    'veneer': {
-        'pfm': {
-            'allowed_subtypes': [],  # Veneer 不能用 PFM
-            'reason': 'Veneer must use all-ceramic materials to ensure translucency'
-        },
-        'metal-free': {
-            'allowed_subtypes': ['zineer', 'emax', 'composite'],
-            'forbidden_subtypes': ['calypso', 'fmz-ultra', 'fmz', 'lava', 'lava-esthetic', 'lava-plus'],
-            'reason': 'Veneer requires all-ceramic materials with excellent translucency'
-        },
-        'full-cast': {
-            'allowed_subtypes': [],  # Veneer 不能用金屬
-            'reason': 'Veneer must use all-ceramic materials'
-        }
-    },
-    'inlay': {
-        'pfm': {
-            'allowed_subtypes': [],
-            'reason': 'Inlay 不適用 PFM'
-        },
-        'metal-free': {
-            'allowed_subtypes': ['ips-emax', 'composite'],
-            'reason': 'Inlay 建議使用全瓷或複合樹脂'
-        },
-        'full-cast': {
-            'allowed_subtypes': ['yellow-gold-high-precious', 'yellow-gold-semi-precious', 'white-gold', 'yellow-gold-low-precious', 'np', 'pure-titanium'],
-            'reason': 'Inlay can use all-metal'
-        }
-    },
-    'onlay': {
-        'pfm': {
-            'allowed_subtypes': [],
-            'reason': 'Onlay 不適用 PFM'
-        },
-        'metal-free': {
-            'allowed_subtypes': ['ips-emax', 'fmz'],
-            'reason': 'Onlay 建議使用全瓷'
-        },
-        'full-cast': {
-            'allowed_subtypes': ['yellow-gold-high-precious', 'pure-titanium'],
-            'reason': 'Onlay 可使用全金屬'
+        'onlay': {
+            'pfm': {
+                'allowed_subtypes': [],
+                'forbidden_subtypes': [],
+                'reason': 'Onlay 不適用 PFM'
+            },
+            'metal-free': {
+                'allowed_subtypes': ['emax', 'fmz'],
+                'forbidden_subtypes': [],
+                'reason': 'Onlay 建議使用全瓷'
+            },
+            'full-cast': {
+                'allowed_subtypes': ['high-precious-gold', 'pure-titanium'],
+                'forbidden_subtypes': [],
+                'reason': 'Onlay 可使用全金屬'
+            }
         }
     }
-}
     
     # === 驗證修復類型 ===
     if restoration_type not in compatibility_rules:
@@ -303,40 +240,47 @@ def validate_material_compatibility(params):
             'allowed_categories': [cat for cat, rules in restoration_rules.items() if rules['allowed_subtypes']]
         }
     
-    # === 驗證子類型（如果提供） ===
-    if normalized_subtype:
-    # 將 allowed_subtypes 也標準化為小寫進行比對
-        allowed_subtypes_lower = [s.lower() for s in category_rules.get('allowed_subtypes', [])]
-        forbidden_subtypes_lower = [s.lower() for s in category_rules.get('forbidden_subtypes', [])]
+    # === 查詢模式：返回可用的子類型列表 ===
+    if not normalized_subtype:
+        return {
+            'valid': True,
+            'query_mode': True,
+            'message': f'{restoration_type} + {normalized_category} 的可用子類型',
+            'material_category': normalized_category,
+            'allowed_subtypes': category_rules['allowed_subtypes'],
+            'reason': category_rules['reason']
+        }
+    
+    # === 驗證模式：驗證特定子類型 ===
     
     # 檢查是否在禁止列表
-        if normalized_subtype in forbidden_subtypes_lower:
-            return {
-                'valid': False,
-                'message': f'{restoration_type} 不能使用 {normalized_subtype}。請選擇其他材料。',
-                'error_type': 'forbidden_subtype',
-                'allowed_subtypes': category_rules['allowed_subtypes']
-            }
+    if normalized_subtype in category_rules.get('forbidden_subtypes', []):
+        return {
+            'valid': False,
+            'message': f'{restoration_type} 不能使用 {normalized_subtype}。{category_rules["reason"]}',
+            'error_type': 'forbidden_subtype',
+            'allowed_subtypes': category_rules['allowed_subtypes']
+        }
     
     # 檢查是否在允許列表
-        if normalized_subtype not in allowed_subtypes_lower:
-            return {
-                'valid': False,
-                'message': f'{restoration_type} + {normalized_category} 不支援 {normalized_subtype}',
-                'error_type': 'incompatible_subtype',
-                'allowed_subtypes': category_rules['allowed_subtypes']
-            }
+    if normalized_subtype not in category_rules['allowed_subtypes']:
+        return {
+            'valid': False,
+            'message': f'{restoration_type} + {normalized_category} 不支援 {normalized_subtype}。{category_rules["reason"]}',
+            'error_type': 'incompatible_subtype',
+            'allowed_subtypes': category_rules['allowed_subtypes']
+        }
     
     # === 特殊檢查：Bridge 跨度 ===
     warnings = []
     if restoration_type == 'bridge' and bridge_span > 3:
-        if normalized_category == 'metal-free' and normalized_subtype not in ['fmz', 'lava']:
-            warnings.append(f'跨度超過 3 單位的牙橋使用 {normalized_subtype}，建議改用 FMZ 或 Lava 以獲得更好的強度')
+        if normalized_category == 'metal-free' and normalized_subtype not in ['fmz', 'fmz-ultra', 'lava']:
+            warnings.append(f'跨度超過 3 單位的牙橋使用 {normalized_subtype}，建議改用 FMZ、FMZ Ultra 或 Lava 以獲得更好的強度')
     
     # === 驗證通過 ===
     return {
         'valid': True,
-        'message': f'{restoration_type} 使用 {normalized_category}' + (f' ({normalized_subtype})' if normalized_subtype else '') + ' 驗證通過',
+        'message': f'{restoration_type} 使用 {normalized_category} ({normalized_subtype}) 驗證通過',
         'material_category': normalized_category,
         'material_subtype': normalized_subtype,
         'allowed_subtypes': category_rules['allowed_subtypes'],

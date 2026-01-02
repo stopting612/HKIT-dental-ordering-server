@@ -1,6 +1,8 @@
 # tools.py
 from rules import validate_bridge_positions, validate_material_compatibility
 from knowledge_base import kb_search
+from material_normalizer import normalize_material
+
 
 TOOLS = [
     {
@@ -130,6 +132,7 @@ TOOLS = [
 ]
 
 
+
 def execute_tool(tool_name: str, arguments: dict):
     """執行工具"""
     
@@ -140,33 +143,60 @@ def execute_tool(tool_name: str, arguments: dict):
         return validate_material_compatibility(arguments)
     
     elif tool_name == "search_products":
-        results = kb_search.search_by_criteria(
-            restoration_type=arguments.get('restoration_type'),
-            material=arguments.get('material_category'),
-            position_type=arguments.get('position_type')
-        )
-        
-        # 如果有子類型，進一步過濾
+        restoration_type = arguments.get('restoration_type')
+        material_category = arguments.get('material_category')
         material_subtype = arguments.get('material_subtype')
-        if material_subtype and results:
-            filtered = []
-            subtype_lower = material_subtype.lower()
-            
-            for r in results:
-                content_lower = r.get('content', '').lower()
-                if subtype_lower in content_lower:
-                    filtered.append(r)
-            
-            if filtered:
-                results = filtered
+        position_type = arguments.get('position_type')
         
-        # 格式化結果
+        print(f"\n🔍 搜尋產品")
+        
+        # 建立搜尋查詢
+        if material_subtype:
+            # 標準化材料子類型
+            normalized_subtype = normalize_material(
+                material_subtype, 
+                material_category, 
+                use_llm=False
+            )
+            
+            # 組合查詢（讓 KB 自己判斷相關性）
+            query = f"{restoration_type} {material_category} {normalized_subtype}"
+            
+            if position_type:
+                query += f" {position_type}"
+            
+            print(f"   查詢: '{query}'")
+            
+            # 搜尋（更多結果以便過濾）
+            results = kb_search.search_products(query, num_results=10)
+            
+            # Score 過濾（只保留高相關度）
+            if results:
+                threshold = 0.5  # 可調整
+                filtered = [r for r in results if r.get('score', 0) >= threshold]
+                
+                if filtered:
+                    print(f"   📊 Score 過濾: {len(results)} → {len(filtered)} (threshold: {threshold})")
+                    results = filtered
+        else:
+            # 沒有子類型，使用類別搜尋
+            results = kb_search.search_by_criteria(
+                restoration_type=restoration_type,
+                material=material_category,
+                position_type=position_type
+            )
+        
+        # 格式化結果（最多 3 個）
         products = []
-        for result in results[:3]:
+        for idx, result in enumerate(results[:3]):
+            score = result.get('score', 0)
             products.append({
-                'content': result.get('content', '')[:300],
-                'score': result.get('score', 0)
+                'content': result.get('content', '')[:500],
+                'score': score
             })
+            print(f"   [{idx+1}] Score: {score:.3f}")
+        
+        print(f"   ✅ 返回 {len(products)} 個產品\n")
         
         return {
             'found': len(products) > 0,
