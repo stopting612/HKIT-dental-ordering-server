@@ -98,35 +98,61 @@ TOOLS = [
             "description": """搜尋產品目錄並返回產品資訊（包括產品名稱、代碼、價格、製作時間等）。
 
 **何時使用此工具：**
-1. 用戶詢問產品資訊（例如：「有什麼 emax 產品？」）
-2. 用戶詢問價格（例如：「emax 多少錢？」「全瓷冠價格？」）
-3. 用戶詢問製作時間（例如：「要做多久？」）
-4. 需要推薦具體產品給用戶選擇
-5. 驗證材料後，需要展示可用產品
+1. 用戶詢問產品資訊
+2. 用戶詢問價格或製作時間
+3. 需要推薦具體產品給用戶選擇
+4. 驗證材料後，需要展示可用產品
 
-**重要：**
-- 這是唯一能查詢產品價格和詳細資訊的工具
-- 必須在收集完 restoration_type, material_category, material_subtype 後呼叫
-- 返回的產品包含：產品名稱、代碼、價格、製作時間、技術規格等""",
+**重要：這是唯一能查詢產品價格和詳細資訊的工具**
+
+**關於查詢字串 (search_query)：**
+你需要根據上下文構建一個**語義豐富的查詢字串**，讓向量搜尋能找到最相關的產品。
+
+**查詢字串應該包含：**
+- 修復類型（crown, bridge, veneer 等）
+- 材料資訊（metal-free, pfm, emax, zirconia 等）
+- 適用位置（如果知道：anterior/前牙, posterior/後牙）
+- 其他相關描述詞
+
+**範例：**
+✅ 好的查詢：
+- "metal-free crown for anterior teeth using emax material"
+- "high noble pfm crown gold alloy"
+- "posterior zirconia crown high strength"
+- "前牙全瓷冠 emax 美觀"
+
+❌ 不好的查詢：
+- "crown pfm high-noble"（太簡短，缺乏語義）
+- "11"（只有牙位號碼）
+
+**提示：**
+- 可以混用中英文以提高召回率
+- 加入材料的特性描述（如：美觀、高強度、生物相容性）
+- 如果用戶有特殊要求，加入查詢中
+""",
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "search_query": {
+                        "type": "string",
+                        "description": "語義豐富的搜尋查詢字串，用於向量搜尋。應包含修復類型、材料、位置等資訊。"
+                    },
                     "restoration_type": {
                         "type": "string",
                         "enum": ["crown", "bridge", "veneer", "inlay", "onlay"],
-                        "description": "修復類型"
+                        "description": "修復類型（用於後續處理）"
                     },
                     "material_category": {
                         "type": "string",
                         "enum": ["pfm", "metal-free", "full-cast"],
-                        "description": "材料主類別"
+                        "description": "材料主類別（用於後續處理）"
                     },
                     "material_subtype": {
                         "type": "string",
-                        "description": "材料子類型（例如：emax, fmz, non-precious, semi-precious 等）"
+                        "description": "材料子類型（用於後續處理）"
                     }
                 },
-                "required": ["restoration_type", "material_category", "material_subtype"]
+                "required": ["search_query", "restoration_type", "material_category", "material_subtype"]
             }
         }
     },
@@ -296,30 +322,63 @@ def store_patient_name(patient_name: str) -> Dict[str, Any]:
     }
 
 def execute_tool(tool_name: str, arguments: dict):
-    """執行工具"""
+    """
+    執行工具
     
-    if tool_name == "validate_bridge":
-        return validate_bridge_positions(arguments)
+    Args:
+        tool_name: 工具名稱
+        arguments: 工具參數字典
     
-    elif tool_name == "validate_material":
-        return validate_material_compatibility(arguments)
+    Returns:
+        工具執行結果
+    """
     
-    elif tool_name == "search_products":
-        restoration_type = arguments.get('restoration_type')
-        material_category = arguments.get('material_category')
-        material_subtype = arguments.get('material_subtype')
-        position_type = arguments.get('position_type')
+    print(f"\n🔧 執行工具: {tool_name}")
+    print(f"   參數: {arguments}")
+    
+    try:
+        if tool_name == "validate_bridge":
+            return validate_bridge_positions(arguments)
         
-        # 直接調用 search_products 函數
-        result = search_products(
-            restoration_type=restoration_type,
-            material_category=material_category,
-            material_subtype=material_subtype
-        )
+        elif tool_name == "validate_material":
+            return validate_material_compatibility(arguments)
         
-        return result
-
-    elif tool_name == "store_patient_name":
-        return store_patient_name(**arguments)
-    else:
-        return {"error": f"Unknown tool: {tool_name}"}
+        elif tool_name == "search_products":
+            # ✅ 使用 **arguments 自動展開所有參數
+            # 確保 search_query, restoration_type, material_category, material_subtype 都被傳入
+            return search_products(**arguments)
+        
+        elif tool_name == "store_patient_name":
+            return store_patient_name(**arguments)
+        
+        else:
+            return {
+                "error": True,
+                "message": f"未知的工具: {tool_name}",
+                "tool": tool_name
+            }
+    
+    except TypeError as e:
+        # 捕獲參數不匹配的錯誤
+        print(f"   ❌ 參數錯誤: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        return {
+            "error": True,
+            "message": f"工具參數不匹配: {str(e)}",
+            "tool": tool_name,
+            "arguments_received": arguments
+        }
+    
+    except Exception as e:
+        # 捕獲其他錯誤
+        print(f"   ❌ 執行失敗: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        return {
+            "error": True,
+            "message": f"工具執行失敗: {str(e)}",
+            "tool": tool_name
+        }

@@ -114,10 +114,28 @@ class KnowledgeBaseSearch:
 # 獨立函數：search_products（供 tools.py 調用）
 # ============================================================
 
-def search_products(restoration_type: str, material_category: str, material_subtype: str) -> dict:
-    """搜尋產品"""
+def search_products(
+    search_query: str,
+    restoration_type: str,
+    material_category: str,
+    material_subtype: str
+) -> dict:
+    """
+    搜尋產品（AI 生成查詢版本）
+    
+    Args:
+        search_query: AI 生成的語義豐富的查詢字串
+        restoration_type: 修復類型（用於結構化資料）
+        material_category: 材料主類別（用於結構化資料）
+        material_subtype: 材料子類型（用於結構化資料）
+    
+    Returns:
+        產品搜尋結果
+    """
     
     print(f"\n🔍 搜尋產品")
+    print(f"   AI 生成的查詢: '{search_query}'")
+    print(f"   結構化資料: {restoration_type} / {material_category} / {material_subtype}")
     
     # ✅ 檢查 kb_search 是否可用
     if kb_search is None:
@@ -130,65 +148,62 @@ def search_products(restoration_type: str, material_category: str, material_subt
             "count": 0
         }
     
-    # 標準化材料
-    normalized_subtype = normalize_material(material_subtype, material_category, use_llm=False)
-    
-    # 構建查詢
-    query = f"{restoration_type} {material_category} {normalized_subtype}"
-    print(f"   查詢: '{query}'")
-    
     try:
-        # 呼叫 Knowledge Base
-        results = kb_search.search_products(query, num_results=10)
+        # ✅ 直接使用 AI 生成的查詢（不做任何修改）
+        results = kb_search.search_products(search_query, num_results=10)
         
         if not results:
             return {
                 "found": False,
-                "message": f"沒有找到 {material_category} ({normalized_subtype}) 的 {restoration_type} 產品",
+                "message": f"沒有找到相關產品，請嘗試其他材料或修改搜尋條件",
                 "products": [],
                 "count": 0
             }
         
-        # 🆕 格式化產品資訊（突出價格）
+        # 格式化產品資訊（與之前相同）
         formatted_products = []
         
-        for idx, result in enumerate(results[:5], 1):  # 最多返回 5 個
+        for idx, result in enumerate(results[:5], 1):
             content = result.get('content', '')
             score = result.get('score', 0)
             
-            # 🆕 提取價格資訊（使用正則表達式）
+            # 提取資訊（與之前相同）
             import re
             
-            # 🆕 提取價格資訊（匹配 "**價格範圍**: HKD 12,000 - 15,000"）
-            price_match = re.search(r'(?:價格(?:範圍)?|price|費用)[*\s:：]*(?:HK\$|HKD|港幣)?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)\s*(?:-|至|to)?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)?', content, re.IGNORECASE)
+            # 提取價格
+            price_match = re.search(
+                r'(?:價格(?:範圍)?|price|費用)[*\s:：]*(?:HK\$|HKD|港幣)?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)\s*(?:-|至|to)?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)?',
+                content,
+                re.IGNORECASE
+            )
             
             if price_match:
                 min_price = price_match.group(1)
                 max_price = price_match.group(2)
-                if max_price:
-                    price = f"{min_price} - {max_price}"
-                else:
-                    price = min_price
+                price = f"{min_price} - {max_price}" if max_price else min_price
             else:
                 price = "請查詢"
             
-            # 🆕 提取製作時間
-            time_match = re.search(r'(?:製作時間|delivery|工作天)[:：\s]*(\d+-?\d*)\s*(?:天|days?|工作天)', content, re.IGNORECASE)
+            # 提取製作時間
+            time_match = re.search(
+                r'(?:製作時間|delivery|工作天)[:：\s]*(\d+-?\d*)\s*(?:天|days?|工作天)',
+                content,
+                re.IGNORECASE
+            )
             delivery_time = time_match.group(1) if time_match else "5-7"
             
-            # 🆕 提取產品代碼（匹配 "**產品代碼**: 1200" 或 "**產品代碼**: 1100, 9033"）
-            code_match = re.search(r'(?:產品代碼|product\s*code|代碼)[*\s:：]*([\d,\s]+)', content, re.IGNORECASE)
-            if code_match:
-                # 提取所有代碼，去除空格
-                product_code = code_match.group(1).replace(' ', '')
-            else:
-                product_code = f"{1000 + idx}"
+            # 提取產品代碼
+            code_match = re.search(
+                r'(?:產品代碼|product\s*code|代碼)[*\s:：]*([\d,\s]+)',
+                content,
+                re.IGNORECASE
+            )
+            product_code = code_match.group(1).replace(' ', '') if code_match else f"{1000 + idx}"
             
-            # 🆕 提取材料名稱（用於區分相同代碼的產品）
+            # 提取材料名稱
             material_match = re.search(r'\*\*材料\*\*[:\s：]*([^\n*]+)', content, re.IGNORECASE)
             material_name = material_match.group(1).strip() if material_match else ""
             
-            # 限制內容長度
             content_preview = content[:200] + "..." if len(content) > 200 else content
             
             formatted_products.append({
@@ -201,11 +216,10 @@ def search_products(restoration_type: str, material_category: str, material_subt
                 "score": round(score, 2)
             })
         
-        # 🆕 構建友好的回應訊息
-        summary = f"找到 {len(formatted_products)} 個 {material_category} ({normalized_subtype}) 的 {restoration_type} 產品：\n\n"
+        # 構建回應
+        summary = f"找到 {len(formatted_products)} 個相關產品：\n\n"
         
         for p in formatted_products:
-            # 如果有材料名稱，顯示以幫助區分
             material_info = f" ({p['material_name']})" if p['material_name'] else ""
             summary += f"{p['rank']}. 產品代碼 {p['product_code']}{material_info}\n"
             summary += f"   💰 價格: HK${p['price']}\n"
@@ -221,7 +235,8 @@ def search_products(restoration_type: str, material_category: str, material_subt
             "count": len(formatted_products),
             "restoration_type": restoration_type,
             "material_category": material_category,
-            "material_subtype": normalized_subtype
+            "material_subtype": material_subtype,
+            "search_query": search_query  # 記錄 AI 生成的查詢
         }
     
     except Exception as e:
