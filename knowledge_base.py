@@ -3,6 +3,12 @@ import boto3
 import os
 from typing import List, Dict, Optional
 import sys
+from dotenv import load_dotenv
+
+# 載入環境變數
+load_dotenv()
+
+from material_normalizer import normalize_material
 
 class KnowledgeBaseSearch:
     """
@@ -66,44 +72,21 @@ class KnowledgeBaseSearch:
             print("  4. IAM 權限是否足夠（需要 bedrock:Retrieve）\n")
             raise ConnectionError(error_msg)
     
-    
-    def search_products(self, query: str, num_results: int = 5) -> List[Dict]:
+    def search_products(self, query: str, num_results: int = 10) -> List[Dict]:
         """
-        搜尋產品
+        使用 Knowledge Base 搜尋產品
         
         Args:
-            query: 搜尋查詢字串（例如："crown 全瓷 前牙"）
-            num_results: 返回結果數量（預設 5，最大 100）
-        
-        Returns:
-            產品列表，每個產品包含：
-            {
-                'content': str,      # 產品描述文字
-                'score': float,      # 相關度分數 (0-1)
-                'metadata': dict,    # 產品 metadata
-                'source': dict       # 來源資訊 (S3 URI 等)
-            }
-        
-        Raises:
-            ValueError: 如果 num_results 超出範圍
-            Exception: 如果 API 呼叫失敗
-        """
-        
-        # 驗證參數
-        if num_results < 1 or num_results > 100:
-            raise ValueError(f"num_results 必須在 1-100 之間，目前值：{num_results}")
-        
-        try:
-            print(f"🔍 搜尋 Knowledge Base")
-            print(f"   查詢: '{query}'")
-            print(f"   返回數量: {num_results}")
+            query: 搜尋查詢字串
+            num_results: 返回結果數量
             
-            # 呼叫 Bedrock Knowledge Base API
+        Returns:
+            List[Dict]: 搜尋結果列表，每個結果包含 content 和 score
+        """
+        try:
             response = self.client.retrieve(
                 knowledgeBaseId=self.kb_id,
-                retrievalQuery={
-                    'text': query
-                },
+                retrievalQuery={'text': query},
                 retrievalConfiguration={
                     'vectorSearchConfiguration': {
                         'numberOfResults': num_results
@@ -111,231 +94,191 @@ class KnowledgeBaseSearch:
                 }
             )
             
-            # 解析結果
             results = []
-            retrieval_results = response.get('retrievalResults', [])
+            for item in response.get('retrievalResults', []):
+                results.append({
+                    'content': item.get('content', {}).get('text', ''),
+                    'score': item.get('score', 0)
+                })
             
-            if not retrieval_results:
-                print(f"   ⚠️  沒有找到相關產品")
-                return []
-            
-            print(f"   ✅ 找到 {len(retrieval_results)} 個結果")
-            
-            for idx, item in enumerate(retrieval_results):
-                # 提取內容
-                content = item.get('content', {}).get('text', '')
-                score = item.get('score', 0)
-                metadata = item.get('metadata', {})
-                location = item.get('location', {})
-                
-                # 構建結果
-                result = {
-                    'content': content,
-                    'score': score,
-                    'metadata': metadata,
-                    'source': location
-                }
-                
-                results.append(result)
-                
-                # Debug 輸出（顯示前 100 字）
-                preview = content[:100].replace('\n', ' ')
-                print(f"   [{idx+1}] Score: {score:.3f} | {preview}...")
-            
-            print()
             return results
             
-        except self.client.exceptions.ResourceNotFoundException:
-            error_msg = f"❌ Knowledge Base 不存在: {self.kb_id}"
-            print(error_msg)
-            print("   請檢查 KNOWLEDGE_BASE_ID 是否正確")
-            raise
-            
-        except self.client.exceptions.AccessDeniedException:
-            error_msg = "❌ 權限不足：無法存取 Knowledge Base"
-            print(error_msg)
-            print("   請檢查 IAM 權限，需要：bedrock:Retrieve")
-            raise
-            
         except Exception as e:
-            error_msg = f"❌ Knowledge Base 搜尋失敗"
-            print(error_msg)
-            print(f"   錯誤類型: {type(e).__name__}")
-            print(f"   錯誤訊息: {str(e)}")
-            raise
+            print(f"❌ Knowledge Base 查詢失敗: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+
+
+# ============================================================
+# 獨立函數：search_products（供 tools.py 調用）
+# ============================================================
+
+def search_products(restoration_type: str, material_category: str, material_subtype: str) -> dict:
+    """搜尋產品"""
     
+    print(f"\n🔍 搜尋產品")
     
-    def search_by_criteria(self, 
-                          restoration_type: str, 
-                          material: Optional[str] = None, 
-                          position_type: Optional[str] = None) -> List[Dict]:
-        """
-        根據訂單條件搜尋產品
-        
-        Args:
-            restoration_type: 修復類型（crown, bridge, veneer, inlay, onlay）
-            material: 材料類型（metal-free, pfm, zirconia, full-metal）
-            position_type: 位置類型（anterior, posterior）
-        
-        Returns:
-            產品列表（最多 3 個）
-        """
-        
-        # 材料名稱標準化（中文 → 英文）
-        material_map = {
-            # 英文
-            'metal-free': 'metal-free',
-            'all-ceramic': 'metal-free',
-            'ceramic': 'metal-free',
-            'pfm': 'pfm',
-            'porcelain-fused-to-metal': 'pfm',
-            'porcelain': 'pfm',
-            'full-metal': 'full-metal',
-            'full-cast': 'full-metal',
-            'metal': 'full-metal',
-            'zirconia': 'zirconia',
-            'zir': 'zirconia',
-            # 中文
-            '全瓷': 'metal-free',
-            '陶瓷': 'metal-free',
-            '烤瓷': 'pfm',
-            '全金屬': 'full-metal',
-            '全金': 'full-metal',
-            '金屬': 'full-metal',
-            '氧化鋯': 'zirconia',
-            '鋯': 'zirconia'
+    # ✅ 檢查 kb_search 是否可用
+    if kb_search is None:
+        error_msg = "Knowledge Base 未初始化，請檢查 AWS 設定"
+        print(f"   ❌ {error_msg}")
+        return {
+            "error": True,
+            "message": error_msg,
+            "products": [],
+            "count": 0
         }
-        
-        # 標準化材料名稱
-        normalized_material = None
-        if material:
-            normalized_material = material_map.get(material.lower(), material)
-        
-        # 建立搜尋查詢（中英文混合，提高召回率）
-        query_parts = []
-        
-        # 1. 修復類型（中英文）
-        restoration_names = {
-            'crown': 'crown 牙冠',
-            'bridge': 'bridge 牙橋',
-            'veneer': 'veneer 貼片',
-            'inlay': 'inlay 嵌體',
-            'onlay': 'onlay 高嵌體'
-        }
-        query_parts.append(restoration_names.get(restoration_type.lower(), restoration_type))
-        
-        # 2. 材料（中英文 + 常見品牌）
-        if normalized_material:
-            material_queries = {
-                'metal-free': '全瓷 metal-free ceramic emax IPS',
-                'pfm': '烤瓷 PFM porcelain fused',
-                'zirconia': '氧化鋯 zirconia FMZ Lava',
-                'full-metal': '全金屬 full-metal gold 黃金'
-            }
-            query_parts.append(material_queries.get(normalized_material, normalized_material))
-        
-        # 3. 位置（中英文）
-        if position_type:
-            position_names = {
-                'anterior': '前牙 anterior front',
-                'posterior': '後牙 posterior back molar'
-            }
-            query_parts.append(position_names.get(position_type.lower(), position_type))
-        
-        # 組合查詢
-        query = ' '.join(query_parts)
-        
-        print(f"\n📋 條件搜尋")
-        print(f"   修復類型: {restoration_type}")
-        print(f"   材料: {normalized_material if normalized_material else '未指定'}")
-        print(f"   位置: {position_type if position_type else '未指定'}")
-        print(f"   查詢字串: '{query}'")
-        
-        # 執行搜尋（多返回一些以便過濾）
-        results = self.search_products(query, num_results=10)
+    
+    # 標準化材料
+    normalized_subtype = normalize_material(material_subtype, material_category, use_llm=False)
+    
+    # 構建查詢
+    query = f"{restoration_type} {material_category} {normalized_subtype}"
+    print(f"   查詢: '{query}'")
+    
+    try:
+        # 呼叫 Knowledge Base
+        results = kb_search.search_products(query, num_results=10)
         
         if not results:
-            return []
-        
-        # 如果有指定材料，進行二次過濾
-        if normalized_material:
-            filtered = []
-            
-            # 定義材料關鍵字（用於內容匹配）
-            material_keywords = {
-                'metal-free': ['全瓷', 'metal-free', 'ceramic', 'emax', 'e.max', 'ips'],
-                'pfm': ['pfm', '烤瓷', 'porcelain fused', 'porcelain-fused'],
-                'zirconia': ['zirconia', 'zir', '氧化鋯', 'fmz', 'lava'],
-                'full-metal': ['full-metal', 'full cast', '全金', '黃金', 'gold', 'titanium', '鈦']
+            return {
+                "found": False,
+                "message": f"沒有找到 {material_category} ({normalized_subtype}) 的 {restoration_type} 產品",
+                "products": [],
+                "count": 0
             }
+        
+        # 🆕 格式化產品資訊（突出價格）
+        formatted_products = []
+        
+        for idx, result in enumerate(results[:5], 1):  # 最多返回 5 個
+            content = result.get('content', '')
+            score = result.get('score', 0)
             
-            keywords = material_keywords.get(normalized_material, [])
+            # 🆕 提取價格資訊（使用正則表達式）
+            import re
             
-            for r in results:
-                # 優先檢查 metadata
-                metadata_material = r.get('metadata', {}).get('material', '').lower()
-                
-                if metadata_material == normalized_material:
-                    filtered.append(r)
-                    continue
-                
-                # 檢查內容文字
-                content_lower = r.get('content', '').lower()
-                
-                if any(keyword.lower() in content_lower for keyword in keywords):
-                    filtered.append(r)
+            # 🆕 提取價格資訊（匹配 "**價格範圍**: HKD 12,000 - 15,000"）
+            price_match = re.search(r'(?:價格(?:範圍)?|price|費用)[*\s:：]*(?:HK\$|HKD|港幣)?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)\s*(?:-|至|to)?\s*(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)?', content, re.IGNORECASE)
             
-            if filtered:
-                print(f"   🔎 過濾後: {len(filtered)} 個產品匹配材料 '{normalized_material}'")
-                # 返回前 3 個最相關的
-                return filtered[:3]
+            if price_match:
+                min_price = price_match.group(1)
+                max_price = price_match.group(2)
+                if max_price:
+                    price = f"{min_price} - {max_price}"
+                else:
+                    price = min_price
             else:
-                print(f"   ⚠️  過濾後沒有產品匹配材料 '{normalized_material}'，返回原始結果")
+                price = "請查詢"
+            
+            # 🆕 提取製作時間
+            time_match = re.search(r'(?:製作時間|delivery|工作天)[:：\s]*(\d+-?\d*)\s*(?:天|days?|工作天)', content, re.IGNORECASE)
+            delivery_time = time_match.group(1) if time_match else "5-7"
+            
+            # 🆕 提取產品代碼（匹配 "**產品代碼**: 1200" 或 "**產品代碼**: 1100, 9033"）
+            code_match = re.search(r'(?:產品代碼|product\s*code|代碼)[*\s:：]*([\d,\s]+)', content, re.IGNORECASE)
+            if code_match:
+                # 提取所有代碼，去除空格
+                product_code = code_match.group(1).replace(' ', '')
+            else:
+                product_code = f"{1000 + idx}"
+            
+            # 🆕 提取材料名稱（用於區分相同代碼的產品）
+            material_match = re.search(r'\*\*材料\*\*[:\s：]*([^\n*]+)', content, re.IGNORECASE)
+            material_name = material_match.group(1).strip() if material_match else ""
+            
+            # 限制內容長度
+            content_preview = content[:200] + "..." if len(content) > 200 else content
+            
+            formatted_products.append({
+                "rank": idx,
+                "content": content_preview,
+                "price": price,
+                "delivery_time": f"{delivery_time} 工作天",
+                "product_code": product_code,
+                "material_name": material_name,
+                "score": round(score, 2)
+            })
         
-        # 返回前 3 個結果
-        return results[:3]
+        # 🆕 構建友好的回應訊息
+        summary = f"找到 {len(formatted_products)} 個 {material_category} ({normalized_subtype}) 的 {restoration_type} 產品：\n\n"
+        
+        for p in formatted_products:
+            # 如果有材料名稱，顯示以幫助區分
+            material_info = f" ({p['material_name']})" if p['material_name'] else ""
+            summary += f"{p['rank']}. 產品代碼 {p['product_code']}{material_info}\n"
+            summary += f"   💰 價格: HK${p['price']}\n"
+            summary += f"   ⏰ 製作時間: {p['delivery_time']}\n"
+            summary += f"   📋 {p['content'][:100]}...\n\n"
+        
+        print(f"   ✅ 找到 {len(formatted_products)} 個產品")
+        
+        return {
+            "found": True,
+            "message": summary,
+            "products": formatted_products,
+            "count": len(formatted_products),
+            "restoration_type": restoration_type,
+            "material_category": material_category,
+            "material_subtype": normalized_subtype
+        }
+    
+    except Exception as e:
+        print(f"   ❌ 搜尋失敗: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        return {
+            "error": True,
+            "message": f"搜尋失敗: {str(e)}",
+            "products": [],
+            "count": 0
+        }
     
     
-    def format_products_for_display(self, products: List[Dict]) -> str:
-        """
-        格式化產品列表為可讀文字
-        
-        Args:
-            products: 產品列表
-        
-        Returns:
-            格式化的產品描述文字
-        """
-        
-        if not products:
-            return "沒有找到相關產品。"
-        
-        formatted = []
-        
-        for idx, product in enumerate(products, 1):
-            content = product.get('content', '')
-            score = product.get('score', 0)
-            
-            # 提取產品代碼（如果有）
-            product_code = product.get('metadata', {}).get('product_code', '')
-            
-            # 限制內容長度（最多 300 字）
-            if len(content) > 300:
-                content = content[:297] + '...'
-            
-            formatted.append(f"{idx}. {content}\n   (相關度: {score:.2f})")
-        
-        return '\n\n'.join(formatted)
-
+    
+    
 
 # 建立全域實例
+kb_search = None  # 先設為 None
 try:
-    kb_search = KnowledgeBaseSearch()
-except (EnvironmentError, ConnectionError) as e:
-    print(f"\n{'='*60}")
-    print("⚠️  Knowledge Base 初始化失敗")
-    print(f"{'='*60}")
-    print("伺服器將無法正常運作。")
-    print("請修正 .env 設定後重新啟動。\n")
-    # 不要直接 sys.exit()，讓 FastAPI 可以啟動並顯示錯誤訊息
+    print("\n" + "="*60)
+    print("🔧 初始化 Bedrock Knowledge Base...")
+    print("="*60)
+    
+    # 檢查環境變數
+    required_vars = ['AWS_REGION', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'KNOWLEDGE_BASE_ID']
+    missing = [v for v in required_vars if not os.getenv(v)]
+    
+    if missing:
+        print(f"\n⚠️  缺少環境變數: {', '.join(missing)}")
+        print(f"\n請在 .env 中設定：")
+        for var in missing:
+            print(f"   {var}=...")
+        print(f"\n⚠️  Knowledge Base 功能將被禁用")
+        print(f"="*60 + "\n")
+        kb_search = None
+    else:
+        # 初始化
+        kb_search = KnowledgeBaseSearch()
+        
+        print(f"\n✅ Knowledge Base 初始化成功")
+        print(f"="*60 + "\n")
+
+except ValueError as e:
+    # 環境變數缺失 - 僅警告，不停止啟動
+    print(f"\n⚠️  Knowledge Base 初始化失敗: {e}")
+    print(f"\n⚠️  Knowledge Base 功能將被禁用，但伺服器可以啟動")
+    print(f"="*60 + "\n")
+    kb_search = None
+
+except Exception as e:
+    # 其他錯誤 - 也僅警告
+    print(f"\n⚠️  Knowledge Base 初始化失敗: {e}")
+    print(f"\n完整錯誤：")
+    import traceback
+    traceback.print_exc()
+    print(f"\n⚠️  Knowledge Base 功能將被禁用，但伺服器可以啟動")
+    print(f"="*60 + "\n")
     kb_search = None
