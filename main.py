@@ -11,11 +11,13 @@ from typing import Optional, Dict, List
 from datetime import datetime
 import time
 
+from models import CredentialsResponse
 from tools import TOOLS, execute_tool
 from order_manager import order_manager
 from conversation_manager import conversation_manager, session_manager
 
 from knowledge_base import kb_search
+from transcribe_policy import TRANSCRIBE_POLICY
 
 if kb_search is None:
     print("\n" + "="*60)
@@ -698,6 +700,55 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
     )
 
 
+
+@app.post("/api/aws/credentials", response_model=CredentialsResponse)
+async def get_temporary_credentials():
+    """
+    生成 AWS 臨時憑證供 Flutter App 使用
+    有效期：1 小時
+    """
+    try:
+        # 創建 STS 客戶端
+        AWS_REGION = os.getenv("AWS_TRANSCRIBE_REGION", "ap-southeast-1")
+
+        sts_client = boto3.client(
+            'sts',
+            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+            region_name=AWS_REGION
+        )
+        
+        # 使用 GetFederationToken 生成臨時憑證
+        response = sts_client.get_federation_token(
+            Name='DentalAppUser',  # 臨時用戶名稱
+            Policy=str(TRANSCRIBE_POLICY).replace("'", '"'),  # 轉換為 JSON 字串
+            DurationSeconds=3600  # 1 小時（最小值）
+        )
+        
+        credentials = response['Credentials']
+        
+        return CredentialsResponse(
+            access_key_id=credentials['AccessKeyId'],
+            secret_access_key=credentials['SecretAccessKey'],
+            session_token=credentials['SessionToken'],
+            expiration=credentials['Expiration'].isoformat(),
+            region=AWS_REGION
+        )
+        
+    except ClientError as e:
+        error_code = e.response['Error']['Code']
+        error_message = e.response['Error']['Message']
+        
+        raise HTTPException(
+            status_code=500,
+            detail=f"AWS STS Error [{error_code}]: {error_message}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected error: {str(e)}"
+        )
+
 # ===== 輔助函數 =====
 
 def _extract_order_data(session_id: str, tool_name: str, tool_args: dict, tool_result: dict):
@@ -786,6 +837,8 @@ def _link_conversations_to_order(session_id: str, order_id: int):
         print(f"✅ 對話已關聯到訂單: {session_id} → Order #{order_id}")
     except Exception as e:
         print(f"⚠️  關聯對話失敗: {e}")
+
+
 
 
 # ===== 其他 API Endpoints =====
