@@ -3,6 +3,8 @@ from rules import validate_bridge_positions, validate_material_compatibility
 from knowledge_base import kb_search, search_products
 from material_normalizer import normalize_material
 from typing import Dict, Any
+from tooth_validator import validate_tooth_position, get_valid_tooth_ranges
+
 import re
 TOOLS = [
     {
@@ -199,7 +201,40 @@ TOOLS = [
             "required": ["patient_name"]
         }
     }
-}
+},
+{
+        "type": "function",
+        "function": {
+            "name": "validate_tooth_positions",
+            "description": """Validate tooth position numbers according to FDI notation.
+            
+            CRITICAL: ALWAYS call this tool FIRST when user provides tooth positions, 
+            before any other validation (including validate_bridge).
+            
+            FDI System (32 permanent teeth):
+            - Quadrant 1 (Upper Right): 11-18
+            - Quadrant 2 (Upper Left): 21-28  
+            - Quadrant 3 (Lower Left): 31-38
+            - Quadrant 4 (Lower Right): 41-48
+            
+            Invalid examples:
+            - 19, 20 (position 9, 0 don't exist)
+            - 50, 60 (quadrants 5, 6 don't exist)
+            - 10, 09 (invalid format)
+            
+            Returns: validation result with valid/invalid teeth details""",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tooth_positions": {
+                        "type": "string",
+                        "description": "Comma or space-separated tooth numbers (e.g., '11,12,13' or '14 15 16')"
+                    }
+                },
+                "required": ["tooth_positions"]
+            }
+        }
+    },
 ]
 
 def store_patient_name(patient_name: str) -> Dict[str, Any]:
@@ -350,6 +385,9 @@ def execute_tool(tool_name: str, arguments: dict):
         
         elif tool_name == "store_patient_name":
             return store_patient_name(**arguments)
+        
+        elif tool_name == "validate_tooth_positions":
+            return _validate_tooth_positions(**arguments)
         
         else:
             return {

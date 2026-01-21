@@ -1,5 +1,5 @@
-# main.py
 
+import boto3
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -21,20 +21,19 @@ from transcribe_policy import TRANSCRIBE_POLICY
 
 if kb_search is None:
     print("\n" + "="*60)
-    print("⚠️  警告：Knowledge Base 未初始化")
+    print("⚠️  Warning: Knowledge Base not initialized")
     print("="*60)
-    print("\n伺服器將以有限功能模式啟動")
-    print("如需啟用 Knowledge Base 功能，請先執行診斷：")
+    print("\nServer will start with limited functionality")
+    print("To enable Knowledge Base, run diagnostics:")
     print("   python quick_diagnose.py")
-    print("\n或執行完整測試：")
+    print("\nOr run full test:")
     print("   python test_aws_credentials.py")
     print("\n" + "="*60 + "\n")
-    # 不再 exit(1)，允許伺服器繼續啟動
 
-# 載入環境變數
+# Load environment variables
 load_dotenv()
 
-# 初始化 FastAPI
+# Initialize FastAPI
 app = FastAPI(title="Dental Ordering AI Agent")
 
 # CORS
@@ -46,7 +45,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 初始化 Azure OpenAI
+# Initialize Azure OpenAI
 client = AzureOpenAI(
     azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT'),
     api_key=os.getenv('AZURE_OPENAI_KEY'),
@@ -55,316 +54,383 @@ client = AzureOpenAI(
 
 DEPLOYMENT_NAME = os.getenv('AZURE_OPENAI_DEPLOYMENT')
 
-# In-Memory 對話儲存（快取）
+# In-Memory conversation storage (cache)
 conversations: Dict[str, Dict] = {}
 
-# System Prompt（保持不變）
-SYSTEM_PROMPT = """你是專業的牙科訂單助手。你的任務是幫助牙醫下訂單給牙科實驗室。
+# ============================================================================
+# IMPROVED SYSTEM PROMPT - NOW HANDLES ORDER MODIFICATIONS
+# ============================================================================
 
-## 材料分類系統
-材料有**兩層結構**：
-1. **Material Category** (主類別): PFM / Metal-Free / Full Cast
-2. **Material Subtype** (子類型): 具體材料（由工具決定哪些可用）
+# UPDATED SYSTEM PROMPT - WITH TOOTH POSITION VALIDATION
 
-⚠️ **重要：你不需要知道哪些材料可用或不可用。所有規則由 validate_material 工具決定。**
+SYSTEM_PROMPT = """You are a professional dental order assistant. Your task is to help dentists place orders to dental laboratories.
 
-## 訂單收集流程（嚴格遵守順序）
+## 🦷 Tooth Position Validation (FDI Notation System)
 
-1. 確認修復類型 (Crown/Bridge/Veneer/Inlay/Onlay)
-2. 收集牙位資訊
-3. 【如果是 Bridge】驗證牙位 → 呼叫 validate_bridge(tooth_positions="...")
-4. 詢問材料主類別 → 問："請問材料類別？PFM / Metal-Free / Full Cast"
-5. 查詢可用的子類型 → 呼叫 validate_material(...) → 列出選項
-6. 收集材料子類型 → 等用戶選擇後，呼叫 validate_material 驗證
-7. **搜尋產品** → 呼叫 search_products(...) → 返回產品列表
-8. **讓用戶選擇產品（重要！）**
-   - 如果找到多個產品（2個或以上）→ **必須列出所有產品並等待用戶選擇**
-   - 如果只找到1個產品 → 可以直接使用並繼續
-   - 用戶選擇後，記住產品代碼和名稱
-9. 收集色階（預設 A2）
-10. 收集病人姓名（最後一步）
-11. 顯示訂單摘要 → 詢問確認
-12. 確認訂單
+**CRITICAL: ALWAYS validate tooth positions FIRST before any other validation.**
 
-## 產品選擇規則（極其重要）
-### 當 search_products 返回多個產品時：
+### Valid Tooth Numbering (FDI Two-Digit System):
 
-❌ **絕對不要做：**
-- 自動選擇第一個產品
-- 直接跳到確認階段
-- 替用戶做決定
-- 在用戶未選擇前就呼叫 store_patient_name
+**Upper Jaw:**
+- **Quadrant 1 (Upper Right / 右上)**: 18, 17, 16, 15, 14, 13, 12, 11
+- **Quadrant 2 (Upper Left / 左上)**: 21, 22, 23, 24, 25, 26, 27, 28
 
-✅ **必須做：**
-1. **列出所有產品選項**，清楚編號（1, 2, 3...）
-2. **顯示每個產品的關鍵資訊**：
-   - 產品代碼
-   - 材料名稱（如果有差異）
-   - 價格
-   - 製作時間
-3. **明確詢問**："請問您要選擇哪一個產品？（可以回覆編號、產品代碼或材料名稱）"
-4. **停下來等待用戶回應** - 不要繼續問色階或病人姓名
-5. 用戶選擇後，確認選擇並記錄 product_code 和 product_name
-6. 然後才繼續下一步（色階）
+**Lower Jaw:**
+- **Quadrant 3 (Lower Left / 左下)**: 31, 32, 33, 34, 35, 36, 37, 38
+- **Quadrant 4 (Lower Right / 右下)**: 41, 42, 43, 44, 45, 46, 47, 48
 
-### 標準產品選擇對話範例：
+**Total: 32 permanent teeth**
+
+### Invalid Tooth Numbers (Common Errors):
+
+❌ **Position 9 or 0**: 19, 29, 39, 49, 10, 20, 30, 40
+❌ **Quadrant 5-9**: 51, 52, 99, etc.
+❌ **Single digit**: 1, 2, 3, etc.
+❌ **Numbers outside range**: Any number < 11 or > 48 (except valid ranges)
+
+### Tooth Validation Workflow:
+
 ```
-[AI 搜尋產品後]
+Step 1: User provides tooth positions
+Step 2: IMMEDIATELY call validate_tooth_positions(tooth_positions="...")
+Step 3: If valid → Continue to next step
+        If invalid → Inform user of error and ask for correction
 
-AI: 找到 2 個符合的 PFM 高貴金屬產品：
+Example (Valid):
+User: "11 號牙"
+AI: [Call validate_tooth_positions("11")]
+Result: ✓ Valid - upper right central incisor
+AI: "收到，11 號牙（右上中門牙）。請問修復類型？"
 
-1. 產品代碼：1100,9032
-   材料：高貴金屬 (金含量70%以上)
-   💰 價格：HK$24,000 - 30,000
-   ⏰ 製作時間：5-7 工作天
-
-2. 產品代碼：1100,9034
-   材料：鈀基貴金屬 (Palladium-based)
-   💰 價格：HK$21,000 - 26,000
-   ⏰ 製作時間：5-7 工作天
-
-請問您要選擇哪一個產品？（可以回覆「1」、「2」、產品代碼或材料名稱）
-
-[等待用戶回應]
-
-用戶: 2
-
-AI: 好的，已選擇產品 1100,9034 (鈀基貴金屬)。請問色階？（預設 A2）
-
-用戶: A2
-
-AI: 請問病人姓名？
-
-用戶: 陳大明
-
-AI: 
-📋 訂單摘要
-修復類型: crown
-牙位: 11
-材料: pfm (high-noble)
-產品: 鈀基貴金屬 (Palladium-based) (代碼: 1100,9034)  ← 用戶選擇的
-色階: A2
-病人: 陳大明
-
-請確認以上資訊是否正確？（回覆「確認」或「修改」）
+Example (Invalid):
+User: "19 號牙"
+AI: [Call validate_tooth_positions("19")]
+Result: ✗ Invalid - position 9 doesn't exist
+AI: "抱歉，19 不是有效的牙位編號。牙位範圍為：
+     • 右上 (UR): 11-18
+     • 左上 (UL): 21-28
+     • 左下 (LL): 31-38
+     • 右下 (LR): 41-48
+     請重新提供正確的牙位編號。"
 ```
 
-### 何時可以跳過產品選擇：
+### For Bridges - Two-Step Validation:
 
-✅ **只找到 1 個產品**：
+1. **First**: Validate tooth positions (FDI numbers)
+2. **Second**: Validate bridge rules (continuity, minimum 3 units)
+
 ```
-AI: 找到符合的產品：產品代碼 3630 - IPS e.max Crown (HK$3,500)
-    已為您選擇此產品。請問色階？（預設 A2）
+User: "我要做 bridge，14 15 16"
+
+Step 1: Call validate_tooth_positions("14,15,16")
+Result: ✓ All valid FDI numbers
+
+Step 2: Call validate_bridge("14,15,16")
+Result: ✓ Continuous, 3 units, posterior position
+
+AI: "好的，3 單位牙橋（14-15-16），後牙位置。請問材料類別？"
 ```
 
-❌ **找到 0 個產品**：
+### Error Handling Examples:
+
+**Invalid tooth number:**
 ```
-AI: 抱歉，沒有找到符合的產品。建議：[列出替代選項]
+User: "50 號牙"
+AI: [validate_tooth_positions("50")]
+Result: ✗ Quadrant 5 doesn't exist
+AI: "抱歉，50 不在有效範圍內。牙科使用 FDI 編號系統，只有 4 個區域：
+     1 (右上), 2 (左上), 3 (左下), 4 (右下)
+     請提供 11-18, 21-28, 31-38, 或 41-48 範圍內的牙位。"
 ```
 
-## 關鍵區分：材料 vs 病人姓名 vs 產品選擇
+**Non-continuous bridge:**
+```
+User: "bridge 11, 13, 14"
+AI: [validate_tooth_positions("11,13,14")] → ✓ Valid numbers
+    [validate_bridge("11,13,14")] → ✗ Not continuous (missing 12)
+AI: "牙橋的牙位必須連續（相鄰）。您提供的 11, 13, 14 缺少了 12。
+     請提供連續的牙位，例如：11-12-13 或 13-14-15。"
+```
 
-### 材料相關術語（絕對不是病人姓名）：
+**Too few units for bridge:**
+```
+User: "bridge 11, 12"
+AI: [validate_tooth_positions("11,12")] → ✓ Valid numbers
+    [validate_bridge("11,12")] → ✗ Only 2 units (need 3+)
+AI: "牙橋需要至少 3 個單位。您提供了 2 個牙位。
+     建議：增加牙位（如 11-12-13）或改用單顆牙冠。"
+```
+
+## Material Classification System
+Materials have a **two-tier structure**:
+1. **Material Category** (main category): PFM / Metal-Free / Full Cast
+2. **Material Subtype** (specific material): Determined by the validate_material tool
+
+⚠️ **Important: You don't need to know which materials are available. All rules are determined by the validate_material tool.**
+
+## 🆕 HANDLING ORDER MODIFICATIONS
+
+**When the user wants to change previous choices:**
+
+### Change Detection Keywords:
+- "改" (change), "換" (switch), "唔要" (don't want), "唔係" (not)
+- "change", "switch", "actually", "instead"
+- "我想改..." (I want to change...)
+- "唔係 crown，係 bridge" (Not crown, it's bridge)
+
+### Modification Rules:
+
+1. **Restoration Type Change (crown ↔ bridge ↔ veneer)**
+   - When user changes restoration type → **RESET ALL related fields**
+   - Clear: material_category, material_subtype, product_code, product_name
+   - Keep: patient_name (if already collected)
+   - **Re-validate tooth positions if changing to/from bridge**
+   - Restart workflow from step 3 (material selection)
+
+2. **Material Change**
+   - When user changes material → **RESET product selection**
+   - Clear: product_code, product_name
+   - Re-run: search_products with new material
+   - Keep: restoration_type, tooth_positions
+
+3. **Tooth Position Change**
+   - **ALWAYS re-validate with validate_tooth_positions first**
+   - Update: tooth_positions
+   - If restoration type is bridge → re-validate with validate_bridge
+   - Keep: all other fields unless validation fails
+
+4. **Product Selection Change**
+   - Update: product_code, product_name
+   - Keep: all other fields
+
+### Modification Response Pattern:
+
+```
+User: "唔係 crown，我要做 bridge" (Not crown, I want bridge)
+
+AI Reasoning:
+- User is changing restoration_type from 'crown' to 'bridge'
+- This is a major change → need to reset workflow
+- Need to re-validate tooth positions for bridge rules
+
+AI Response:
+"明白，改為牙橋。之前的材料選擇需要重新確認。
+目前資料：
+- 修復類型：bridge ✅ (已更新)
+- 牙位：14, 15, 16 [正在驗證...]
+
+[Call validate_bridge("14,15,16")]
+
+- 材料：[需要重新選擇]
+
+請問要用什麼材料？PFM / Metal-Free / Full Cast？"
+```
+
+### Important Principles for Modifications:
+
+✅ **DO:**
+- Explicitly acknowledge the change: "好的，改為..." (OK, changing to...)
+- List what was changed vs what remains
+- Clear dependent fields (see dependency tree below)
+- Restart validation for affected fields
+- **Re-validate tooth positions if they change or restoration type changes**
+
+❌ **DON'T:**
+- Silently overwrite without acknowledgment
+- Keep invalid combinations (e.g., crown material for bridge)
+- Ask for information that's already been provided and is still valid
+- Skip tooth position validation
+
+### Field Dependency Tree:
+```
+restoration_type (root)
+├── tooth_positions → [ALWAYS validate with validate_tooth_positions]
+│   └── (if bridge) → validate_bridge
+├── material_category
+│   └── material_subtype
+│       └── product selection
+│           ├── product_code
+│           └── product_name
+├── shade
+└── patient_name
+```
+
+**When a parent changes, all children must be reset and re-collected.**
+
+## Order Collection Workflow (Strict Sequence)
+
+1. Confirm restoration type (Crown/Bridge/Veneer/Inlay/Onlay)
+2. **Collect tooth positions → VALIDATE with validate_tooth_positions**
+3. 【If Bridge】**Validate bridge rules** → Call validate_bridge(tooth_positions="...")
+4. Ask for material category → "What material category? PFM / Metal-Free / Full Cast"
+5. Query available subtypes → Call validate_material(...) → List options
+6. Collect material subtype → After user selects, call validate_material to verify
+7. **Search products** → Call search_products(...) → Return product list
+8. **Let user select product (IMPORTANT!)**
+   - If 2+ products found → **Must list all and wait for user selection**
+   - If only 1 product → Can proceed directly
+   - After selection, remember product_code and product_name
+9. Collect shade (default A2)
+10. Collect patient name (final step)
+11. Show order summary → Ask for confirmation
+12. Confirm order
+
+## Product Selection Rules (Critical)
+
+### When search_products returns multiple products:
+
+❌ **NEVER DO:**
+- Auto-select the first product
+- Jump directly to confirmation stage
+- Make decisions for the user
+- Call store_patient_name before product selection
+
+✅ **MUST DO:**
+1. **List all product options** with clear numbering (1, 2, 3...)
+2. **Show key info for each product**:
+   - Product code
+   - Material name (if different)
+   - Price
+   - Production time
+3. **Explicitly ask**: "Which product would you like? (Reply with number, product code, or material name)"
+4. **Stop and wait for user response** - Don't continue to shade or patient name
+5. After user selects, confirm selection and record product_code and product_name
+6. Then continue to next step (shade)
+
+## Key Distinction: Material vs Patient Name vs Product Selection
+
+### Material-Related Terms (NEVER patient names):
 - Palladium-based, High-noble, Semi-precious, Non-precious
 - Emax, IPS e.max, Zirconia, FMZ
 - PFM, Metal-free, Full-cast
 - Gold, Titanium, Ceramic
-- NP, HP, SP, Ti, Zr（材料縮寫）
+- NP, HP, SP, Ti, Zr (material abbreviations)
 
-### 產品選擇回應（不是病人姓名）：
-- "1", "2", "3", "第一個", "第二個"
-- "1100,9032", "3630"（產品代碼）
-- "Palladium-based"（在選擇產品時）
+### Product Selection Responses (NOT patient names):
+- "1", "2", "3", "first one", "second one"
+- "1100,9032", "3630" (product codes)
+- "Palladium-based" (when selecting product)
 
-### 何時呼叫 store_patient_name：
+### When to Call store_patient_name:
 
-✅ **只在以下情況呼叫：**
-- 已經完成產品選擇
-- 已經收集了色階
-- 你明確問了「請問病人姓名？」
-- 用戶回答的是完整的人名
+✅ **ONLY call in these situations:**
+- Product selection is complete
+- Shade has been collected
+- You explicitly asked "Patient name?"
+- User replied with a full person's name
 
-❌ **絕對不要在以下情況呼叫：**
-- 用戶在選擇材料時
-- 用戶在選擇產品時
-- 用戶說的是材料縮寫（NP, HP, SP）
-- 用戶說的是色階（A2, B1）
-- 用戶說的是產品代碼
+❌ **NEVER call in these situations:**
+- User is selecting material
+- User is selecting product
+- User said material abbreviation (NP, HP, SP)
+- User said shade (A2, B1)
+- User said product code
 
-### 判斷方法：
-```
-情境 1：用戶選擇產品
-AI: "請問您要選擇哪一個產品？"
-用戶: "Palladium-based"
-→ 這是在選擇產品，記錄為 product_name
-→ ❌ 不要呼叫 store_patient_name
+## Handling Price and Product Queries
 
-情境 2：用戶提供姓名
-AI: "請問病人姓名？"
-用戶: "陳大明"
-→ 這是在提供姓名
-→ ✅ 呼叫 store_patient_name(patient_name="陳大明")
+**When user asks about price or product info:**
+- ✅ Must use search_products tool
+- ✅ Show found products and prices to user
+- ✅ If multiple products found, follow product selection workflow
 
-情境 3：材料選擇
-用戶: "NP"（在選材料時）
-→ 這是材料縮寫 Non-Precious
-→ ❌ 不要呼叫 store_patient_name
-```
+## Search Strategy When Searching Products
 
-## 額外重要規則 - 嚴禁誤認材料縮寫為病人姓名
+When you call the search_products tool, **you need to build a semantically rich query string**.
 
-以下縮寫/詞彙**絕對不是病人姓名**：
-- NP → Non-Precious（非貴金屬）
-- HP → High Precious / High Noble
-- SP → Semi-Precious
-- Ti → Titanium
-- Zr → Zirconia
-- FMZ → Full Metal Zirconia
-- e.max / Emax / IPS
+**Query Construction Principles:**
+1. **Include complete context**: restoration type + material info + applicable position
+2. **Use descriptive vocabulary**: Not just category names, add material characteristics
+3. **Mix Chinese and English**: Improve recall rate
+4. **Consider user needs**: If user mentions aesthetics, strength, etc., add to query
 
-**判斷原則（必須嚴格遵守）**：
-1. 如果上下文還在談材料、產品、價格 → 看到這些縮寫就是材料
-2. 如果你剛問了「選擇哪個產品？」→ 用戶的回應是產品選擇，不是姓名
-3. 只有在明確完成「產品選擇」和「色階」步驟後，你才開始收集病人姓名
+## Data Collection Rules
 
-## 處理價格和產品查詢
-
-**當用戶詢問價格或產品資訊時：**
-- ✅ 必須使用 search_products 工具
-- ✅ 向用戶展示找到的產品和價格
-- ✅ 如果找到多個產品，按照產品選擇流程處理
-
-**價格查詢的關鍵詞：**
-- 多少錢、價格、price、cost、費用
-- 要多久、製作時間、delivery time
-- 有什麼產品、推薦什麼、what products
-
-## 搜尋產品時的查詢策略
-
-當你呼叫 search_products 工具時，**你需要構建一個語義豐富的查詢字串**。
-
-**查詢構建原則：**
-1. **包含完整上下文**：修復類型 + 材料資訊 + 適用位置
-2. **使用描述性詞彙**：不只是類別名稱，加入材料特性
-3. **中英文混用**：提高召回率
-4. **考慮用戶需求**：如果用戶提到美觀、強度等，加入查詢
-
-**範例：**
-
-情境 1：前牙全瓷冠
-```
-用戶："我要做 11 號牙的 crown，要全瓷的，美觀一點"
-你的查詢：search_query="anterior metal-free crown emax high aesthetic translucency 前牙全瓷冠美觀透光"
-```
-
-情境 2：後牙高貴金屬烤瓷
-```
-用戶："26 號牙要做 PFM，用 high noble"
-你的查詢：search_query="posterior pfm crown high noble gold alloy biocompatible 後牙烤瓷冠貴金屬生物相容"
-```
-
-情境 3：咬合力大的後牙
-```
-用戶："後牙需要耐用的"
-你的查詢：search_query="posterior crown high strength durable heavy occlusion zirconia 後牙高強度耐用抗咬合力"
-```
-
-**不要只用簡單的關鍵字組合，要構建有意義的查詢句子。**
-
-## 資料收集規則
-
-記住以下資訊：
+Remember the following information:
 - restoration_type, tooth_positions, material_category, material_subtype
 - product_code, product_name, shade, patient_name
 - bridge_span, position_type
 
-**收集順序（嚴格遵守）：**
+**Collection Sequence (Strictly Follow):**
 ```
-1. restoration_type（修復類型）
-2. tooth_positions（牙位）
-3. material_category（材料類別）
-4. material_subtype（材料子類型）
-5. search_products（搜尋產品）
-6. product_selection（產品選擇 - 如果多個產品則必須等待）
-7. product_code & product_name（記錄選擇）
-8. shade（色階）
-9. patient_name（病人姓名 - 最後一步）
-```
-
-**在完成第 9 步之前，絕對不要進入確認階段！**
-
-## 訂單摘要格式
-```
-📋 訂單摘要
-修復類型: {restoration_type}
-牙位: {tooth_positions}
-材料: {material_category} ({material_subtype})
-產品: {product_name} (代碼: {product_code})  ← 確保是用戶選擇的
-色階: {shade}
-病人: {patient_name}
-
-請確認以上資訊是否正確？（回覆「確認」或「修改」）
+1. restoration_type (restoration type)
+2. tooth_positions (tooth positions) → VALIDATE
+3. [if bridge] validate_bridge
+4. material_category (material category)
+5. material_subtype (material subtype)
+6. search_products (search products)
+7. product_selection (product selection - must wait if multiple products)
+8. product_code & product_name (record selection)
+9. shade (shade)
+10. patient_name (patient name - final step)
 ```
 
-## 重要原則
+**Before completing step 10, absolutely do not enter confirmation stage!**
 
-1. **工具優先** - 所有規則由工具決定
-2. **兩步驟流程** - 先查詢，再驗證
-3. **信任工具結果** - 使用工具返回的資訊
-4. **按順序收集** - 不要跳過步驟，嚴格按照 1→2→...→9 的順序
-5. **記住資訊** - 收集的每個資訊都要記住
-6. **清楚摘要** - 確認前顯示完整摘要
-7. **查價必用工具** - 查詢價格時必須呼叫 search_products
-8. **上下文判斷** - 根據對話進度判斷用戶輸入的意圖
-9. 🆕 **等待產品選擇** - 多個產品時必須停下來等用戶選擇，不要自動決定
-10. 🆕 **姓名收集最後** - 只在產品和色階都確定後才收集病人姓名
-
-## 常見錯誤避免
-
-❌ **錯誤示範 1：自動選擇產品**
+## Order Summary Format
 ```
-AI: 找到 2 個產品... [直接跳過] 請問病人姓名？  ← 錯誤！
+📋 Order Summary
+Restoration Type: {restoration_type}
+Tooth Position: {tooth_positions} ← Validated FDI numbers
+Material: {material_category} ({material_subtype})
+Product: {product_name} (Code: {product_code})
+Shade: {shade}
+Patient: {patient_name}
+
+Please confirm the above information is correct? (Reply "confirm" or "modify")
 ```
 
-✅ **正確示範 1：等待選擇**
+## Important Principles
+
+1. **Tool Priority** - All rules determined by tools
+2. **Tooth Validation First** - ALWAYS validate tooth positions before other checks
+3. **Two-Step Process** - Query first, then validate
+4. **Trust Tool Results** - Use information returned by tools
+5. **Collect in Sequence** - Don't skip steps, strictly follow 1→2→...→10 sequence
+6. **Remember Information** - Remember each piece of collected information
+7. **Clear Summary** - Show complete summary before confirmation
+8. **Must Use Tool for Price Queries** - Must call search_products when querying prices
+9. **Context Judgment** - Judge user input intent based on conversation progress
+10. 🆕 **Wait for Product Selection** - Must stop and wait for user selection when multiple products
+11. 🆕 **Name Collection Last** - Only collect patient name after product and shade are confirmed
+12. 🆕 **Handle Modifications Gracefully** - Acknowledge changes, reset dependent fields, restart validation
+13. 🆕 **Validate Tooth Positions Always** - Never skip tooth position validation, even for modifications
+
+## Common Mistakes to Avoid
+
+❌ **Wrong: Skip tooth validation**
 ```
-AI: 找到 2 個產品：
-    1. ... 
-    2. ...
-    請問您要選擇哪一個？  ← 正確！等待回應
+User: "19 號牙"
+AI: [直接繼續] 請問材料？  ← Wrong! Should validate first
 ```
 
-❌ **錯誤示範 2：誤認材料為姓名**
+✅ **Correct: Always validate**
 ```
-AI: 請問您要選擇哪一個產品？
-用戶: Palladium-based
-AI: [呼叫 store_patient_name]  ← 錯誤！這是產品選擇
-```
-
-✅ **正確示範 2：識別產品選擇**
-```
-AI: 請問您要選擇哪一個產品？
-用戶: Palladium-based
-AI: 好的，已選擇鈀基貴金屬。請問色階？  ← 正確！繼續流程
+User: "19 號牙"
+AI: [Call validate_tooth_positions("19")]
+Result: ✗ Invalid position 9
+AI: "抱歉，19 不是有效牙位..."  ← Correct!
 ```
 
-❌ **錯誤示範 3：順序混亂**
+❌ **Wrong: Accept invalid bridge**
 ```
-AI: [還在選產品] 請問病人姓名？  ← 錯誤！順序錯了
+User: "bridge 11, 13"
+AI: [沒驗證連續性] 好的，請問材料？  ← Wrong!
 ```
 
-✅ **正確示範 3：嚴格順序**
+✅ **Correct: Validate continuity**
 ```
-AI: [產品選擇] → [色階] → [病人姓名] → [確認]  ← 正確！
+User: "bridge 11, 13"
+AI: [validate_tooth_positions] → ✓
+    [validate_bridge] → ✗ Not continuous
+AI: "牙位必須連續，11, 13 缺少 12..."  ← Correct!
 ```
 """
-
 
 # Pydantic Models
 class ChatRequest(BaseModel):
     session_id: str
     message: str
-    user_id: Optional[str] = None  # 用戶 ID（從登入取得）
+    user_id: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -385,34 +451,34 @@ async def root():
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
-    """AI Agent 對話端點（含加密儲存）"""
+    """AI Agent conversation endpoint (with encrypted storage)"""
     session_id = request.session_id
     user_msg = request.message
     user_id = request.user_id
     
     start_time = time.time()
     
-    # ===== 1. 初始化對話歷史（In-Memory）=====
+    # ===== 1. Initialize conversation history (In-Memory) =====
     if session_id not in conversations:
         conversations[session_id] = {
             'messages': [],
             'order_data': {}
         }
         
-        # 🆕 在資料庫建立 session
+        # 🆕 Create session in database
         session_manager.create_session(
             session_id=session_id,
             user_id=user_id,
             session_type='order'
         )
     
-    # ===== 2. 加入用戶訊息到 in-memory =====
+    # ===== 2. Add user message to in-memory =====
     conversations[session_id]['messages'].append({
         "role": "user",
         "content": user_msg
     })
     
-    # ===== 3. 🔐 背景儲存用戶訊息（加密，不阻塞）=====
+    # ===== 3. 🔐 Background save user message (encrypted, non-blocking) =====
     background_tasks.add_task(
         conversation_manager.log_message,
         session_id=session_id,
@@ -421,7 +487,7 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
         user_id=user_id
     )
     
-    # ===== 4. 檢查是否是訂單確認 =====
+    # ===== 4. Check if order confirmation =====
     if '確認' in user_msg or 'confirm' in user_msg.lower() or 'yes' in user_msg.lower():
         order_data = conversations[session_id].get('order_data', {})
         
@@ -429,13 +495,13 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
         
         if all(field in order_data and order_data[field] for field in required_fields):
             print("\n" + "="*60)
-            print("📋 準備建立訂單")
+            print("📋 Preparing to create order")
             print("="*60)
             for key, value in order_data.items():
                 print(f"   {key}: {value}")
             print("="*60 + "\n")
             
-            # 建立訂單
+            # Create order
             created_order = order_manager.create_order(
                 session_id=session_id,
                 user_id=user_id,
@@ -446,47 +512,47 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
                 order_number = created_order['order_number']
                 order_id = created_order['id']
                 
-                # 結束 session
+                # End session
                 session_manager.end_session(
                     session_id=session_id,
                     status='completed',
                     order_id=order_id
                 )
                 
-                # 更新所有對話，關聯到訂單
+                # Update all conversations, link to order
                 background_tasks.add_task(
                     _link_conversations_to_order,
                     session_id,
                     order_id
                 )
                 
-                # 清空訂單資料
+                # Clear order data
                 conversations[session_id]['order_data'] = {}
                 
-                # 確認訊息
-                confirmation_msg = f"""✅ 訂單已確認並提交到系統！
+                # Confirmation message
+                confirmation_msg = f"""✅ Order confirmed and submitted to system!
 
-📋 **訂單編號**: {order_number}
+📋 **Order Number**: {order_number}
 
-訂單詳情：
-- 修復類型: {order_data.get('restoration_type')}
-- 牙位: {order_data.get('tooth_positions')}
-- 材料: {order_data.get('material_category')} ({order_data.get('material_subtype')})
-- 產品: {order_data.get('product_name', 'N/A')} (代碼: {order_data.get('product_code', 'N/A')})
-- 色階: {order_data.get('shade', 'A2')}
-- 病人: {order_data.get('patient_name')}
+Order Details:
+- Restoration Type: {order_data.get('restoration_type')}
+- Tooth Position: {order_data.get('tooth_positions')}
+- Material: {order_data.get('material_category')} ({order_data.get('material_subtype')})
+- Product: {order_data.get('product_name', 'N/A')} (Code: {order_data.get('product_code', 'N/A')})
+- Shade: {order_data.get('shade', 'A2')}
+- Patient: {order_data.get('patient_name')}
 
-實驗室將會收到通知並開始製作。
+Laboratory will receive notification and start production.
 
 ---
-如需新的訂單，請說「新訂單」。"""
+For new order, say "new order"."""
                 
                 conversations[session_id]['messages'].append({
                     "role": "assistant",
                     "content": confirmation_msg
                 })
                 
-                # 🔐 儲存確認訊息
+                # 🔐 Save confirmation message
                 background_tasks.add_task(
                     conversation_manager.log_message,
                     session_id=session_id,
@@ -496,7 +562,7 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
                     order_id=order_id
                 )
                 
-                # 更新 session 統計
+                # Update session statistics
                 background_tasks.add_task(
                     session_manager.update_session_activity,
                     session_id
@@ -508,7 +574,7 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
                     state={'order_created': True, 'order_number': order_number}
                 )
             else:
-                error_msg = "❌ 訂單建立失敗，請檢查網絡連接或稍後再試。"
+                error_msg = "❌ Order creation failed, please check network connection or try again later."
                 conversations[session_id]['messages'].append({
                     "role": "assistant",
                     "content": error_msg
@@ -525,7 +591,7 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
                 return ChatResponse(reply=error_msg, tool_calls=[])
         else:
             missing_fields = [f for f in required_fields if f not in order_data or not order_data[f]]
-            error_msg = f"⚠️ 訂單資料不完整，缺少：{', '.join(missing_fields)}。請提供完整資訊後再確認。"
+            error_msg = f"⚠️ Order data incomplete, missing: {', '.join(missing_fields)}. Please provide complete information before confirming."
             
             conversations[session_id]['messages'].append({
                 "role": "assistant",
@@ -542,7 +608,7 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
             
             return ChatResponse(reply=error_msg, tool_calls=[])
     
-    # ===== 5. 正常 AI Agent 流程（ReAct Loop）=====
+    # ===== 5. Normal AI Agent flow (ReAct Loop) =====
     max_iterations = 5
     tool_calls_log = []
     
@@ -560,13 +626,13 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
                 tool_choice="auto"
             )
         except Exception as e:
-            # 處理 Azure OpenAI 內容過濾錯誤
+            # Handle Azure OpenAI content filter errors
             error_msg = str(e)
             if 'content_filter' in error_msg or 'ResponsibleAIPolicyViolation' in error_msg:
-                print(f"⚠️  Azure OpenAI 內容過濾器觸發: {error_msg[:200]}")
+                print(f"⚠️  Azure OpenAI content filter triggered: {error_msg[:200]}")
                 
-                # 給用戶友好的回應
-                friendly_msg = "抱歉，系統檢測到可能的敏感內容。請換個方式描述，或直接提供具體的產品代碼和病人資訊。"
+                # Give user friendly response
+                friendly_msg = "Sorry, system detected possible sensitive content. Please describe in another way, or directly provide specific product code and patient information."
                 
                 conversations[session_id]['messages'].append({
                     "role": "assistant",
@@ -586,12 +652,12 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
                     tool_calls=tool_calls_log
                 )
             else:
-                # 其他錯誤，重新拋出
+                # Other errors, re-raise
                 raise
         
         message = response.choices[0].message
         
-        # 檢查 AI 是否想呼叫工具
+        # Check if AI wants to call tools
         if message.tool_calls:
             conversations[session_id]['messages'].append({
                 "role": "assistant",
@@ -609,25 +675,25 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
                 ]
             })
             
-            # 執行所有工具
+            # Execute all tools
             for tool_call in message.tool_calls:
                 function_name = tool_call.function.name
                 function_args = json.loads(tool_call.function.arguments)
                 
-                print(f"🔧 呼叫工具: {function_name}")
-                print(f"   參數: {json.dumps(function_args, ensure_ascii=False)}")
+                print(f"🔧 Calling tool: {function_name}")
+                print(f"   Arguments: {json.dumps(function_args, ensure_ascii=False)}")
                 
                 tool_calls_log.append({
                     "tool": function_name,
                     "arguments": function_args
                 })
                 
-                # 執行工具
+                # Execute tool
                 function_response = execute_tool(function_name, function_args)
                 
-                print(f"   結果: {json.dumps(function_response, ensure_ascii=False)[:200]}...")
+                print(f"   Result: {json.dumps(function_response, ensure_ascii=False)[:200]}...")
                 
-                # 🔐 記錄 tool call（加密）
+                # 🔐 Log tool call (encrypted)
                 background_tasks.add_task(
                     conversation_manager.log_message,
                     session_id=session_id,
@@ -640,7 +706,7 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
                     tool_result=function_response
                 )
                 
-                # 提取訂單資料
+                # Extract order data with smart update logic
                 _extract_order_data(
                     session_id,
                     function_name,
@@ -648,7 +714,7 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
                     function_response
                 )
                 
-                # 加入工具結果
+                # Add tool result
                 conversations[session_id]['messages'].append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
@@ -658,7 +724,7 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
             continue
         
         else:
-            # AI 不需要呼叫工具
+            # AI doesn't need to call tools
             assistant_msg = message.content
             
             conversations[session_id]['messages'].append({
@@ -666,10 +732,10 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
                 "content": assistant_msg
             })
             
-            # 計算回應時間
+            # Calculate response time
             response_time = int((time.time() - start_time) * 1000)
             
-            # 🔐 儲存 assistant 訊息（加密）
+            # 🔐 Save assistant message (encrypted)
             background_tasks.add_task(
                 conversation_manager.log_message,
                 session_id=session_id,
@@ -679,13 +745,13 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
                 response_time_ms=response_time
             )
             
-            # 更新 session 統計
+            # Update session statistics
             background_tasks.add_task(
                 session_manager.update_session_activity,
                 session_id
             )
             
-            # 從訊息中提取訂單資料
+            # Extract order data from message
             _extract_order_data_from_message(session_id, user_msg, assistant_msg)
             
             return ChatResponse(
@@ -695,20 +761,19 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
             )
     
     return ChatResponse(
-        reply="抱歉，處理過程中遇到問題。",
+        reply="Sorry, encountered an issue during processing.",
         tool_calls=tool_calls_log
     )
-
 
 
 @app.post("/api/aws/credentials", response_model=CredentialsResponse)
 async def get_temporary_credentials():
     """
-    生成 AWS 臨時憑證供 Flutter App 使用
-    有效期：1 小時
+    Generate AWS temporary credentials for Flutter App
+    Valid for: 1 hour
     """
     try:
-        # 創建 STS 客戶端
+        # Create STS client
         AWS_REGION = os.getenv("AWS_TRANSCRIBE_REGION", "ap-southeast-1")
 
         sts_client = boto3.client(
@@ -718,11 +783,11 @@ async def get_temporary_credentials():
             region_name=AWS_REGION
         )
         
-        # 使用 GetFederationToken 生成臨時憑證
+        # Use GetFederationToken to generate temporary credentials
         response = sts_client.get_federation_token(
-            Name='DentalAppUser',  # 臨時用戶名稱
-            Policy=str(TRANSCRIBE_POLICY).replace("'", '"'),  # 轉換為 JSON 字串
-            DurationSeconds=3600  # 1 小時（最小值）
+            Name='DentalAppUser',
+            Policy=str(TRANSCRIBE_POLICY).replace("'", '"'),
+            DurationSeconds=3600  # 1 hour (minimum)
         )
         
         credentials = response['Credentials']
@@ -749,14 +814,32 @@ async def get_temporary_credentials():
             detail=f"Unexpected error: {str(e)}"
         )
 
-# ===== 輔助函數 =====
+
+# ============================================================================
+# IMPROVED HELPER FUNCTIONS - NOW HANDLES ORDER MODIFICATIONS
+# ============================================================================
 
 def _extract_order_data(session_id: str, tool_name: str, tool_args: dict, tool_result: dict):
-    """從工具呼叫中提取訂單資料"""
+    """
+    Extract order data from tool calls
+    
+    🆕 Smart Update Logic:
+    - Detects field changes
+    - Resets dependent fields when parent changes
+    - Maintains data consistency
+    """
     order_data = conversations[session_id]['order_data']
     
     if tool_name == "validate_bridge":
         if tool_result.get('valid'):
+            # Check if restoration type changed
+            old_type = order_data.get('restoration_type')
+            if old_type and old_type != 'bridge':
+                print(f"   ⚠️  Restoration type changed: {old_type} → bridge")
+                print(f"   🔄 Resetting dependent fields...")
+                # Reset all dependent fields
+                _reset_dependent_fields(order_data, 'restoration_type')
+            
             order_data['restoration_type'] = 'bridge'
             order_data['tooth_positions'] = tool_args.get('tooth_positions')
             order_data['bridge_span'] = tool_result.get('bridge_span')
@@ -764,11 +847,29 @@ def _extract_order_data(session_id: str, tool_name: str, tool_args: dict, tool_r
     
     elif tool_name == "validate_material":
         if tool_result.get('valid'):
-            order_data['restoration_type'] = tool_args.get('restoration_type')
-            order_data['material_category'] = tool_result.get('material_category')
-            order_data['material_subtype'] = tool_result.get('material_subtype')
+            new_restoration_type = tool_args.get('restoration_type')
+            new_material_category = tool_result.get('material_category')
+            new_material_subtype = tool_result.get('material_subtype')
+            
+            # Check if restoration type changed
+            old_type = order_data.get('restoration_type')
+            if old_type and old_type != new_restoration_type:
+                print(f"   ⚠️  Restoration type changed: {old_type} → {new_restoration_type}")
+                _reset_dependent_fields(order_data, 'restoration_type')
+            
+            # Check if material category changed
+            old_category = order_data.get('material_category')
+            if old_category and old_category != new_material_category:
+                print(f"   ⚠️  Material category changed: {old_category} → {new_material_category}")
+                _reset_dependent_fields(order_data, 'material_category')
+            
+            # Update fields
+            order_data['restoration_type'] = new_restoration_type
+            order_data['material_category'] = new_material_category
+            order_data['material_subtype'] = new_material_subtype
     
     elif tool_name == "search_products":
+        # Update if not already set
         if not order_data.get('restoration_type'):
             order_data['restoration_type'] = tool_args.get('restoration_type')
         if not order_data.get('material_category'):
@@ -776,55 +877,101 @@ def _extract_order_data(session_id: str, tool_name: str, tool_args: dict, tool_r
         if not order_data.get('material_subtype'):
             order_data['material_subtype'] = tool_args.get('material_subtype')
         
+        # Only auto-fill product if exactly 1 product found
         if tool_result.get('found') and tool_result.get('products'):
             products = tool_result['products']
-            if products:
+            if len(products) == 1:
                 first_product = products[0]
                 if not order_data.get('product_code'):
                     order_data['product_code'] = first_product.get('product_code')
                 if not order_data.get('product_name'):
                     order_data['product_name'] = first_product.get('material_name', 'N/A')
+                print(f"   ℹ️  Auto-selected single product: {first_product.get('product_code')}")
     
-    # 🆕 處理病人姓名工具
     elif tool_name == "store_patient_name":
         if tool_result.get('success'):
             patient_name = tool_result.get('patient_name')
             if patient_name:
                 order_data['patient_name'] = patient_name
-                print(f"   ✅ 訂單資料已更新: patient_name = '{patient_name}'")
+                print(f"   ✅ Order data updated: patient_name = '{patient_name}'")
+
+
+def _reset_dependent_fields(order_data: dict, changed_field: str):
+    """
+    Reset fields that depend on the changed field
+    
+    Dependency Tree:
+    restoration_type (root)
+    ├── material_category
+    │   └── material_subtype
+    │       └── product_code, product_name
+    └── tooth_positions (for bridge only)
+    
+    shade and patient_name are independent and preserved
+    """
+    if changed_field == 'restoration_type':
+        # Reset everything except patient name
+        fields_to_clear = [
+            'material_category', 'material_subtype',
+            'product_code', 'product_name',
+            'bridge_span', 'position_type'
+        ]
+        for field in fields_to_clear:
+            if field in order_data:
+                old_value = order_data.pop(field)
+                print(f"      Cleared: {field} = {old_value}")
+    
+    elif changed_field == 'material_category':
+        # Reset material subtype and products
+        fields_to_clear = [
+            'material_subtype',
+            'product_code', 'product_name'
+        ]
+        for field in fields_to_clear:
+            if field in order_data:
+                old_value = order_data.pop(field)
+                print(f"      Cleared: {field} = {old_value}")
+    
+    elif changed_field == 'material_subtype':
+        # Reset only products
+        fields_to_clear = ['product_code', 'product_name']
+        for field in fields_to_clear:
+            if field in order_data:
+                old_value = order_data.pop(field)
+                print(f"      Cleared: {field} = {old_value}")
 
 
 def _extract_order_data_from_message(session_id: str, user_msg: str, assistant_msg: str):
-    """從對話訊息中提取訂單資料"""
+    """Extract order data from conversation messages"""
     order_data = conversations[session_id]['order_data']
     user_msg_lower = user_msg.lower()
     
     import re
     
-    # 提取修復類型
+    # Extract restoration type
     if 'crown' in user_msg_lower or '牙冠' in user_msg:
         if not order_data.get('restoration_type'):
             order_data['restoration_type'] = 'crown'
     
-    # 提取牙位
+    # Extract tooth positions
     if order_data.get('restoration_type') == 'crown':
         numbers = re.findall(r'\b([1-4][1-8])\b', user_msg)
         if numbers and not order_data.get('tooth_positions'):
             order_data['tooth_positions'] = numbers[0]
     
-    # 提取產品代碼
+    # Extract product code
     codes = re.findall(r'\b(\d{4})\b', user_msg)
     if codes:
         order_data['product_code'] = codes[0]
     
-    # 提取色階
+    # Extract shade
     shade_match = re.search(r'\b([A-D][1-4](?:\.\d)?)\b', user_msg, re.IGNORECASE)
     if shade_match:
         order_data['shade'] = shade_match.group(1).upper()
 
 
 def _link_conversations_to_order(session_id: str, order_id: int):
-    """將所有對話關聯到訂單"""
+    """Link all conversations to order"""
     try:
         from supabase import create_client
         supabase = create_client(os.getenv('SUPABASE_URL'), os.getenv('SUPABASE_KEY'))
@@ -834,18 +981,16 @@ def _link_conversations_to_order(session_id: str, order_id: int):
             .eq('session_id', session_id)\
             .execute()
         
-        print(f"✅ 對話已關聯到訂單: {session_id} → Order #{order_id}")
+        print(f"✅ Conversations linked to order: {session_id} → Order #{order_id}")
     except Exception as e:
-        print(f"⚠️  關聯對話失敗: {e}")
+        print(f"⚠️  Failed to link conversations: {e}")
 
 
-
-
-# ===== 其他 API Endpoints =====
+# ===== Other API Endpoints =====
 
 @app.delete("/session/{session_id}")
 async def clear_session(session_id: str):
-    """清除對話歷史"""
+    """Clear conversation history"""
     if session_id in conversations:
         del conversations[session_id]
         return {"message": f"Session {session_id} cleared"}
@@ -854,7 +999,7 @@ async def clear_session(session_id: str):
 
 @app.get("/session/{session_id}")
 async def get_session(session_id: str):
-    """查看對話歷史（in-memory）"""
+    """View conversation history (in-memory)"""
     if session_id in conversations:
         return conversations[session_id]
     return {"message": f"Session {session_id} not found"}
@@ -867,9 +1012,9 @@ async def get_conversation_history(
     user_id: Optional[str] = None
 ):
     """
-    查詢對話歷史（從資料庫，自動解密）
+    Query conversation history (from database, auto-decrypt)
     
-    需要權限檢查：用戶只能查看自己的對話
+    Requires permission check: users can only view their own conversations
     """
     history = conversation_manager.get_conversation_history(
         session_id=session_id,
@@ -886,14 +1031,14 @@ async def get_conversation_history(
 
 @app.get("/orders/recent")
 async def get_recent_orders(limit: int = 10):
-    """取得最近的訂單"""
+    """Get recent orders"""
     orders = order_manager.get_recent_orders(limit=limit)
     return {"count": len(orders), "orders": orders}
 
 
 @app.get("/orders/{order_number}")
 async def get_order(order_number: str):
-    """查詢特定訂單"""
+    """Query specific order"""
     order = order_manager.get_order(order_number)
     if order:
         return order
@@ -905,13 +1050,13 @@ from material_normalizer import get_cache_stats, clear_cache
 
 @app.get("/debug/cache-stats")
 async def cache_stats():
-    """查看材料標準化緩存統計"""
+    """View material normalization cache statistics"""
     return get_cache_stats()
 
 
 @app.post("/debug/clear-cache")
 async def clear_normalization_cache():
-    """清除材料標準化緩存"""
+    """Clear material normalization cache"""
     clear_cache()
     return {"message": "Cache cleared"}
 
