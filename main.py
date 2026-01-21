@@ -1,20 +1,22 @@
 
 import boto3
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import AzureOpenAI
 from dotenv import load_dotenv
 import os
 import json
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Annotated
 from datetime import datetime
 import time
+from botocore.exceptions import ClientError
 
 from models import CredentialsResponse
 from tools import TOOLS, execute_tool
 from order_manager import order_manager
 from conversation_manager import conversation_manager, session_manager
+from auth_middleware import get_current_user_id, verify_supabase_token, get_optional_user_id
 
 from knowledge_base import kb_search
 from transcribe_policy import TRANSCRIBE_POLICY
@@ -430,7 +432,7 @@ AI: "牙位必須連續，11, 13 缺少 12..."  ← Correct!
 class ChatRequest(BaseModel):
     session_id: str
     message: str
-    user_id: Optional[str] = None
+    # user_id removed - now comes from JWT token
 
 
 class ChatResponse(BaseModel):
@@ -450,11 +452,15 @@ async def root():
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
+async def chat(
+    request: ChatRequest, 
+    background_tasks: BackgroundTasks,
+    user_id: Annotated[str, Depends(get_current_user_id)]  # JWT authentication required
+):
     """AI Agent conversation endpoint (with encrypted storage)"""
     session_id = request.session_id
     user_msg = request.message
-    user_id = request.user_id
+    # user_id now comes from authenticated JWT token
     
     start_time = time.time()
     
@@ -1008,8 +1014,8 @@ async def get_session(session_id: str):
 @app.get("/conversations/{session_id}")
 async def get_conversation_history(
     session_id: str,
-    decrypt: bool = True,
-    user_id: Optional[str] = None
+    user_id: Annotated[str, Depends(get_current_user_id)],  # JWT authentication required
+    decrypt: bool = True
 ):
     """
     Query conversation history (from database, auto-decrypt)
@@ -1030,18 +1036,30 @@ async def get_conversation_history(
 
 
 @app.get("/orders/recent")
-async def get_recent_orders(limit: int = 10):
-    """Get recent orders"""
-    orders = order_manager.get_recent_orders(limit=limit)
+async def get_recent_orders(
+    user_id: Annotated[str, Depends(get_current_user_id)],  # JWT authentication required
+    limit: int = 10
+):
+    """Get recent orders for authenticated user"""
+    orders = order_manager.get_recent_orders(limit=limit, user_id=user_id)
     return {"count": len(orders), "orders": orders}
 
 
 @app.get("/orders/{order_number}")
-async def get_order(order_number: str):
-    """Query specific order"""
+async def get_order(
+    order_number: str,
+    auth_data: Annotated[dict, Depends(verify_supabase_token)]  # JWT authentication required
+):
+    """Query specific order (with ownership verification)"""
     order = order_manager.get_order(order_number)
-    if order:
-        return order
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    
+    # Verify ownership
+    if order.get('user_id') != auth_data['user_id']:
+        raise HTTPException(status_code=403, detail="You don't have permission to access this order")
+    
+    return order
     return {"error": "Order not found"}
 
 
