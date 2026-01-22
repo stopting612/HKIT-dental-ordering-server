@@ -775,13 +775,13 @@ For new order, say "new order"."""
 @app.post("/api/aws/credentials", response_model=CredentialsResponse)
 async def get_temporary_credentials():
     """
-    Generate AWS temporary credentials for Flutter App
+    Generate AWS temporary credentials for Flutter App using AssumeRole
     Valid for: 1 hour
     """
     try:
-        # Create STS client
         AWS_REGION = os.getenv("AWS_TRANSCRIBE_REGION", "ap-southeast-1")
-
+        
+        # Create STS client
         sts_client = boto3.client(
             'sts',
             aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
@@ -789,11 +789,28 @@ async def get_temporary_credentials():
             region_name=AWS_REGION
         )
         
-        # Use GetFederationToken to generate temporary credentials
-        response = sts_client.get_federation_token(
-            Name='DentalAppUser',
-            Policy=str(TRANSCRIBE_POLICY).replace("'", '"'),
-            DurationSeconds=3600  # 1 hour (minimum)
+        # Define inline policy for Transcribe access
+        policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "transcribe:StartStreamTranscription",
+                        "transcribe:StartStreamTranscriptionWebSocket"
+                    ],
+                    "Resource": "*"
+                }
+            ]
+        }
+        
+        # Use AssumeRole instead of GetFederationToken
+        # Replace 'YOUR_ROLE_ARN' with the actual role ARN you'll create
+        response = sts_client.assume_role(
+            RoleArn=os.getenv("AWS_TRANSCRIBE_ROLE_ARN"),  # Add this to .env
+            RoleSessionName='DentalAppSession',
+            Policy=json.dumps(policy),
+            DurationSeconds=3600  # 1 hour
         )
         
         credentials = response['Credentials']
@@ -980,7 +997,7 @@ def _link_conversations_to_order(session_id: str, order_id: int):
     """Link all conversations to order"""
     try:
         from supabase import create_client
-        supabase = create_client(os.getenv('SUPABASE_URL'), os.getenv('SUPABASE_KEY'))
+        supabase = create_client(os.getenv('SUPABASE_URL'), os.getenv('SUPABASE_SERVICE_ROLE_KEY'))
         
         supabase.table('conversations')\
             .update({'order_id': order_id})\
