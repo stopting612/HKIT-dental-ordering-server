@@ -1133,12 +1133,16 @@ async def delete_session_with_conversations(
     """
     Delete session and all related conversations
     
-    Requires authentication and ownership verification.
-    Deletes both the session and all conversation messages associated with it.
+    Behavior:
+    - Sessions with confirmed orders: SOFT DELETE (marked as 'deleted', data preserved)
+    - Sessions without orders: HARD DELETE (permanently removed)
+    
+    Soft-deleted sessions are hidden from user view but preserved for audit trail.
     """
     success = session_manager.delete_session(
         session_id=session_id,
-        user_id=user_id
+        user_id=user_id,
+        allow_order_deletion=False  # Uses soft delete for sessions with orders
     )
     
     if not success:
@@ -1152,8 +1156,9 @@ async def delete_session_with_conversations(
         del conversations[session_id]
     
     return {
-        "message": f"Session {session_id} and all related conversations deleted successfully",
-        "session_id": session_id
+        "message": f"Session {session_id} deleted successfully",
+        "session_id": session_id,
+        "note": "Sessions with orders are soft-deleted and preserved for audit trail"
     }
 
 

@@ -332,7 +332,8 @@ class SessionManager:
         self,
         user_id: str,
         limit: int = 50,
-        status: Optional[str] = None
+        status: Optional[str] = None,
+        include_deleted: bool = False
     ) -> List[Dict]:
         """
         Get all sessions for a specific user
@@ -341,17 +342,22 @@ class SessionManager:
             user_id: User ID (UUID)
             limit: Maximum number of sessions to return
             status: Filter by session status (active, completed, cancelled)
+            include_deleted: Include soft-deleted sessions (default: False, admin only)
         
         Returns:
-            List of session dictionaries
+            List of session dictionaries (excludes deleted sessions by default)
         """
         try:
             print(f"🔍 Querying sessions for user: {user_id}")
-            print(f"   Limit: {limit}, Status filter: {status}")
+            print(f"   Limit: {limit}, Status filter: {status}, Include deleted: {include_deleted}")
             
             query = self.supabase.table('sessions')\
                 .select('*')\
                 .eq('user_id', user_id)
+            
+            # Exclude deleted sessions by default (soft delete)
+            if not include_deleted:
+                query = query.neq('status', 'deleted')
             
             if status:
                 query = query.eq('status', status)
@@ -361,7 +367,7 @@ class SessionManager:
                 .execute()
             
             result = response.data if response.data else []
-            print(f"   ✅ Found {len(result)} sessions")
+            print(f"   ✅ Found {len(result)} sessions (deleted excluded: {not include_deleted})")
             
             return result
         
@@ -374,7 +380,8 @@ class SessionManager:
     def delete_session(
         self,
         session_id: str,
-        user_id: str
+        user_id: str,
+        allow_order_deletion: bool = False
     ) -> bool:
         """
         Delete session and all related conversations
@@ -382,14 +389,19 @@ class SessionManager:
         Args:
             session_id: Session ID to delete
             user_id: User ID for ownership verification
+            allow_order_deletion: Allow deletion of sessions with confirmed orders (admin only)
         
         Returns:
             True if successful, False otherwise
+        
+        Note:
+            Sessions with confirmed orders cannot be deleted by default to preserve audit trail.
+            This prevents data loss in case of disputes.
         """
         try:
-            # First verify ownership
+            # First verify ownership and check order status
             session_data = self.supabase.table('sessions')\
-                .select('user_id')\
+                .select('user_id, order_created, order_id, status')\
                 .eq('session_id', session_id)\
                 .single()\
                 .execute()
@@ -402,20 +414,64 @@ class SessionManager:
                 print(f"❌ Permission denied: User {user_id} cannot delete session {session_id}")
                 return False
             
-            # Delete all conversations for this session
-            conv_response = self.supabase.table('conversations')\
-                .delete()\
-                .eq('session_id', session_id)\
-                .execute()
+            # 🔒 CRITICAL: Soft delete for sessions with confirmed orders
+            has_order = session_data.data.get('order_created') or session_data.data.get('order_id')
             
-            # Delete the session
-            session_response = self.supabase.table('sessions')\
-                .delete()\
-                .eq('session_id', session_id)\
-                .execute()
+            if has_order:
+                # ===== SOFT DELETE: Preserve data for audit trail =====
+                order_id = session_data.data.get('order_id')
+                print(f"🔒 Soft-deleting session with order: {session_id}")
+                print(f"   Order ID: {order_id}")
+                print(f"   Action: Marking as 'deleted' (preserving audit trail)")
+                
+                # Update status to 'deleted' instead of removing
+                soft_delete_response = self.supabase.table('sessions')\
+                    .update({
+                        'status': 'deleted',
+                        'deleted_at': datetime.now().isoformat(),
+                        'deleted_by': user_id
+                    })\
+                    .eq('session_id', session_id)\
+                    .execute()
+                
+                if soft_delete_response.data:
+                    print(f"   ✅ Session marked as deleted (hidden from user view)")
+                    print(f"   💾 Data preserved for audit trail")
+                    return True
+                else:
+                    print(f"   ❌ Soft delete failed")
+                    return False
             
-            print(f"✅ Session deleted: {session_id}")
-            return True
+            else:
+                # ===== HARD DELETE: Permanently remove data =====
+                print(f"🗑️  Hard-deleting session without order: {session_id}")
+                
+                # Step 1: Delete all conversations for this session
+                print(f"   Step 1: Deleting conversations...")
+                conv_response = self.supabase.table('conversations')\
+                    .delete()\
+                    .eq('session_id', session_id)\
+                    .execute()
+                
+                deleted_conversations = len(conv_response.data) if conv_response.data else 0
+                print(f"   ✅ Deleted {deleted_conversations} conversation(s)")
+                
+                # Step 2: Delete the session
+                print(f"   Step 2: Deleting session...")
+                session_response = self.supabase.table('sessions')\
+                    .delete()\
+                    .eq('session_id', session_id)\
+                    .execute()
+                
+                deleted_sessions = len(session_response.data) if session_response.data else 0
+                
+                if deleted_sessions > 0:
+                    print(f"   ✅ Session permanently deleted")
+                    print(f"🎉 Total deleted: {deleted_conversations} conversation(s) + 1 session")
+                    return True
+                else:
+                    print(f"   ⚠️  Session deletion returned 0 rows (may already be deleted)")
+                    return False
         
         except Exception as e:
             print(f"❌ Delete session failed: {e}")
