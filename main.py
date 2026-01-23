@@ -1039,17 +1039,22 @@ async def get_conversation_history(
     
     Requires permission check: users can only view their own conversations
     """
-    history = conversation_manager.get_conversation_history(
-        session_id=session_id,
-        decrypt=decrypt,
-        user_id=user_id
-    )
-    
-    return {
-        "session_id": session_id,
-        "message_count": len(history),
-        "messages": history
-    }
+    try:
+        history = conversation_manager.get_conversation_history(
+            session_id=session_id,
+            decrypt=decrypt,
+            user_id=user_id
+        )
+        
+        return {
+            "session_id": session_id,
+            "message_count": len(history),
+            "messages": history
+        }
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @app.get("/orders/recent")
@@ -1060,6 +1065,96 @@ async def get_recent_orders(
     """Get recent orders for authenticated user"""
     orders = order_manager.get_recent_orders(limit=limit, user_id=user_id)
     return {"count": len(orders), "orders": orders}
+
+
+@app.get("/api/users/me/orders")
+async def get_user_orders(
+    user_id: Annotated[str, Depends(get_current_user_id)],  # JWT authentication required
+    limit: int = 50
+):
+    """
+    Get all orders for authenticated user
+    
+    Returns all orders belonging to the authenticated user with pagination support.
+    """
+    orders = order_manager.get_recent_orders(limit=limit, user_id=user_id)
+    return {
+        "user_id": user_id,
+        "count": len(orders),
+        "orders": orders
+    }
+
+
+@app.get("/api/users/me/sessions")
+async def get_user_sessions(
+    user_id: Annotated[str, Depends(get_current_user_id)],  # JWT authentication required
+    limit: int = 50,
+    status: Optional[str] = None
+):
+    """
+    Get all sessions for authenticated user
+    
+    Args:
+        limit: Maximum number of sessions to return (default: 50)
+        status: Filter by status (active, completed, cancelled) - optional
+    
+    Returns all conversation sessions belonging to the authenticated user.
+    """
+    print(f"\n{'='*60}")
+    print(f"📋 GET /api/users/me/sessions")
+    print(f"{'='*60}")
+    print(f"User ID: {user_id}")
+    print(f"Limit: {limit}")
+    print(f"Status filter: {status}")
+    
+    sessions = session_manager.get_sessions_by_user(
+        user_id=user_id,
+        limit=limit,
+        status=status
+    )
+    
+    print(f"✅ Found {len(sessions)} sessions for user {user_id}")
+    if sessions:
+        print(f"First session: {sessions[0].get('session_id', 'N/A')}")
+    print(f"{'='*60}\n")
+    
+    return {
+        "user_id": user_id,
+        "count": len(sessions),
+        "sessions": sessions
+    }
+
+
+@app.delete("/api/sessions/{session_id}")
+async def delete_session_with_conversations(
+    session_id: str,
+    user_id: Annotated[str, Depends(get_current_user_id)]  # JWT authentication required
+):
+    """
+    Delete session and all related conversations
+    
+    Requires authentication and ownership verification.
+    Deletes both the session and all conversation messages associated with it.
+    """
+    success = session_manager.delete_session(
+        session_id=session_id,
+        user_id=user_id
+    )
+    
+    if not success:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found or you don't have permission to delete it"
+        )
+    
+    # Also clear from in-memory cache if exists
+    if session_id in conversations:
+        del conversations[session_id]
+    
+    return {
+        "message": f"Session {session_id} and all related conversations deleted successfully",
+        "session_id": session_id
+    }
 
 
 @app.get("/orders/{order_number}")

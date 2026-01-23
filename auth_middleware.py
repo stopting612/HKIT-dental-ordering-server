@@ -4,6 +4,7 @@ from fastapi import HTTPException, Header, Depends, status
 from typing import Optional, Annotated
 from supabase import create_client, Client
 from functools import lru_cache
+from datetime import datetime
 import os
 from dotenv import load_dotenv
 
@@ -100,17 +101,84 @@ async def verify_supabase_token(
         )
 
 
+def ensure_user_exists(user_id: str, email: str, user_metadata: dict = None) -> bool:
+    """
+    Ensure user exists in users table (auto-create if needed)
+    
+    This prevents foreign key constraint errors when creating sessions/conversations
+    for authenticated users that don't have a record in the users table yet.
+    
+    Args:
+        user_id: Supabase Auth user ID (UUID)
+        email: User's email address
+        user_metadata: Optional user metadata from JWT token
+    
+    Returns:
+        bool: True if user exists or was created successfully
+    """
+    try:
+        supabase = get_supabase_client()
+        
+        # Check if user already exists
+        existing = supabase.table('users').select('id').eq('id', user_id).execute()
+        
+        if existing.data:
+            return True  # User already exists
+        
+        # Extract full_name from metadata or use email prefix as fallback
+        full_name = None
+        if user_metadata:
+            full_name = user_metadata.get('full_name') or user_metadata.get('name')
+        
+        if not full_name:
+            # Use email prefix as default name (e.g., "john.doe@example.com" → "john.doe")
+            full_name = email.split('@')[0] if email else 'User'
+        
+        # Create new user record
+        new_user = {
+            'id': user_id,
+            'email': email,
+            'full_name': full_name,
+            'role': 'dentist',  # Default role for auto-created users
+            'is_active': True,
+            'is_verified': True,  # Auto-verified for OAuth/JWT users
+            'created_at': datetime.now().isoformat(),
+            'updated_at': datetime.now().isoformat(),
+        }
+        
+        response = supabase.table('users').insert(new_user).execute()
+        
+        if response.data:
+            print(f"✅ Auto-created user record: {email} ({user_id})")
+            return True
+        
+        return False
+        
+    except Exception as e:
+        print(f"❌ Failed to ensure user exists: {e}")
+        return False
+
+
 async def get_current_user_id(
     auth_data: Annotated[dict, Depends(verify_supabase_token)]
 ) -> str:
     """
-
+    Get current user ID from JWT token and ensure user exists in database
+    
+    Usage:
     @app.get("/api/orders")
     async def get_orders(user_id: Annotated[str, Depends(get_current_user_id)]):
-        # user_id 
+        # user_id is guaranteed to exist in database
         pass
     """
-    return auth_data['user_id']
+    user_id = auth_data['user_id']
+    email = auth_data.get('email', '')
+    user_metadata = auth_data.get('user_metadata', {})
+    
+    # Ensure user record exists (auto-create if needed)
+    ensure_user_exists(user_id, email, user_metadata)
+    
+    return user_id
 
 
 # ===== 可選驗證（允許匿名） =====
