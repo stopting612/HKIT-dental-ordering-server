@@ -387,7 +387,7 @@ def execute_tool(tool_name: str, arguments: dict):
             return store_patient_name(**arguments)
         
         elif tool_name == "validate_tooth_positions":
-            return _validate_tooth_positions(**arguments)
+            return validate_tooth_position(**arguments)
         
         else:
             return {

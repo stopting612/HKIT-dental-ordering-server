@@ -10,8 +10,10 @@ AWS_REGION=us-east-2
 KNOWLEDGE_BASE_ID=
 
 
+# Supabase Configuration
 SUPABASE_URL=
-SUPABASE_KEY=
+SUPABASE_ANON_KEY=          # Public key (前端用，安全)
+SUPABASE_SERVICE_ROLE_KEY=  # Service role key (後端用，機密)
 
 
 ENCRYPTION_ENABLED=

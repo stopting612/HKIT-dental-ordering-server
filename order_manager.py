@@ -12,7 +12,7 @@ load_dotenv()
 # 初始化 Supabase 客戶端
 supabase: Client = create_client(
     os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_KEY")
+    os.getenv("SUPABASE_SERVICE_ROLE_KEY")  # Backend uses service role key
 )
 
 

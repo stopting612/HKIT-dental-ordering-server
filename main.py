@@ -1,20 +1,22 @@
 
 import boto3
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import AzureOpenAI
 from dotenv import load_dotenv
 import os
 import json
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Annotated
 from datetime import datetime
 import time
+from botocore.exceptions import ClientError
 
 from models import CredentialsResponse
 from tools import TOOLS, execute_tool
 from order_manager import order_manager
 from conversation_manager import conversation_manager, session_manager
+from auth_middleware import get_current_user_id, verify_supabase_token, get_optional_user_id
 
 from knowledge_base import kb_search
 from transcribe_policy import TRANSCRIBE_POLICY
@@ -430,7 +432,7 @@ AI: "牙位必須連續，11, 13 缺少 12..."  ← Correct!
 class ChatRequest(BaseModel):
     session_id: str
     message: str
-    user_id: Optional[str] = None
+    # user_id removed - now comes from JWT token
 
 
 class ChatResponse(BaseModel):
@@ -450,11 +452,15 @@ async def root():
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
+async def chat(
+    request: ChatRequest, 
+    background_tasks: BackgroundTasks,
+    user_id: Annotated[str, Depends(get_current_user_id)]  # JWT authentication required
+):
     """AI Agent conversation endpoint (with encrypted storage)"""
     session_id = request.session_id
     user_msg = request.message
-    user_id = request.user_id
+    # user_id now comes from authenticated JWT token
     
     start_time = time.time()
     
@@ -769,13 +775,13 @@ For new order, say "new order"."""
 @app.post("/api/aws/credentials", response_model=CredentialsResponse)
 async def get_temporary_credentials():
     """
-    Generate AWS temporary credentials for Flutter App
+    Generate AWS temporary credentials for Flutter App using AssumeRole
     Valid for: 1 hour
     """
     try:
-        # Create STS client
         AWS_REGION = os.getenv("AWS_TRANSCRIBE_REGION", "ap-southeast-1")
-
+        
+        # Create STS client
         sts_client = boto3.client(
             'sts',
             aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
@@ -783,11 +789,28 @@ async def get_temporary_credentials():
             region_name=AWS_REGION
         )
         
-        # Use GetFederationToken to generate temporary credentials
-        response = sts_client.get_federation_token(
-            Name='DentalAppUser',
-            Policy=str(TRANSCRIBE_POLICY).replace("'", '"'),
-            DurationSeconds=3600  # 1 hour (minimum)
+        # Define inline policy for Transcribe access
+        policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": [
+                        "transcribe:StartStreamTranscription",
+                        "transcribe:StartStreamTranscriptionWebSocket"
+                    ],
+                    "Resource": "*"
+                }
+            ]
+        }
+        
+        # Use AssumeRole instead of GetFederationToken
+        # Replace 'YOUR_ROLE_ARN' with the actual role ARN you'll create
+        response = sts_client.assume_role(
+            RoleArn=os.getenv("AWS_TRANSCRIBE_ROLE_ARN"),  # Add this to .env
+            RoleSessionName='DentalAppSession',
+            Policy=json.dumps(policy),
+            DurationSeconds=3600  # 1 hour
         )
         
         credentials = response['Credentials']
@@ -974,7 +997,7 @@ def _link_conversations_to_order(session_id: str, order_id: int):
     """Link all conversations to order"""
     try:
         from supabase import create_client
-        supabase = create_client(os.getenv('SUPABASE_URL'), os.getenv('SUPABASE_KEY'))
+        supabase = create_client(os.getenv('SUPABASE_URL'), os.getenv('SUPABASE_SERVICE_ROLE_KEY'))
         
         supabase.table('conversations')\
             .update({'order_id': order_id})\
@@ -1008,40 +1031,147 @@ async def get_session(session_id: str):
 @app.get("/conversations/{session_id}")
 async def get_conversation_history(
     session_id: str,
-    decrypt: bool = True,
-    user_id: Optional[str] = None
+    user_id: Annotated[str, Depends(get_current_user_id)],  # JWT authentication required
+    decrypt: bool = True
 ):
     """
     Query conversation history (from database, auto-decrypt)
     
     Requires permission check: users can only view their own conversations
     """
-    history = conversation_manager.get_conversation_history(
-        session_id=session_id,
-        decrypt=decrypt,
-        user_id=user_id
-    )
-    
-    return {
-        "session_id": session_id,
-        "message_count": len(history),
-        "messages": history
-    }
+    try:
+        history = conversation_manager.get_conversation_history(
+            session_id=session_id,
+            decrypt=decrypt,
+            user_id=user_id
+        )
+        
+        return {
+            "session_id": session_id,
+            "message_count": len(history),
+            "messages": history
+        }
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @app.get("/orders/recent")
-async def get_recent_orders(limit: int = 10):
-    """Get recent orders"""
-    orders = order_manager.get_recent_orders(limit=limit)
+async def get_recent_orders(
+    user_id: Annotated[str, Depends(get_current_user_id)],  # JWT authentication required
+    limit: int = 10
+):
+    """Get recent orders for authenticated user"""
+    orders = order_manager.get_recent_orders(limit=limit, user_id=user_id)
     return {"count": len(orders), "orders": orders}
 
 
+@app.get("/api/users/me/orders")
+async def get_user_orders(
+    user_id: Annotated[str, Depends(get_current_user_id)],  # JWT authentication required
+    limit: int = 50
+):
+    """
+    Get all orders for authenticated user
+    
+    Returns all orders belonging to the authenticated user with pagination support.
+    """
+    orders = order_manager.get_recent_orders(limit=limit, user_id=user_id)
+    return {
+        "user_id": user_id,
+        "count": len(orders),
+        "orders": orders
+    }
+
+
+@app.get("/api/users/me/sessions")
+async def get_user_sessions(
+    user_id: Annotated[str, Depends(get_current_user_id)],  # JWT authentication required
+    limit: int = 50,
+    status: Optional[str] = None
+):
+    """
+    Get all sessions for authenticated user
+    
+    Args:
+        limit: Maximum number of sessions to return (default: 50)
+        status: Filter by status (active, completed, cancelled) - optional
+    
+    Returns all conversation sessions belonging to the authenticated user.
+    """
+    print(f"\n{'='*60}")
+    print(f"📋 GET /api/users/me/sessions")
+    print(f"{'='*60}")
+    print(f"User ID: {user_id}")
+    print(f"Limit: {limit}")
+    print(f"Status filter: {status}")
+    
+    sessions = session_manager.get_sessions_by_user(
+        user_id=user_id,
+        limit=limit,
+        status=status
+    )
+    
+    print(f"✅ Found {len(sessions)} sessions for user {user_id}")
+    if sessions:
+        print(f"First session: {sessions[0].get('session_id', 'N/A')}")
+    print(f"{'='*60}\n")
+    
+    return {
+        "user_id": user_id,
+        "count": len(sessions),
+        "sessions": sessions
+    }
+
+
+@app.delete("/api/sessions/{session_id}")
+async def delete_session_with_conversations(
+    session_id: str,
+    user_id: Annotated[str, Depends(get_current_user_id)]  # JWT authentication required
+):
+    """
+    Delete session and all related conversations
+    
+    Requires authentication and ownership verification.
+    Deletes both the session and all conversation messages associated with it.
+    """
+    success = session_manager.delete_session(
+        session_id=session_id,
+        user_id=user_id
+    )
+    
+    if not success:
+        raise HTTPException(
+            status_code=404,
+            detail="Session not found or you don't have permission to delete it"
+        )
+    
+    # Also clear from in-memory cache if exists
+    if session_id in conversations:
+        del conversations[session_id]
+    
+    return {
+        "message": f"Session {session_id} and all related conversations deleted successfully",
+        "session_id": session_id
+    }
+
+
 @app.get("/orders/{order_number}")
-async def get_order(order_number: str):
-    """Query specific order"""
+async def get_order(
+    order_number: str,
+    auth_data: Annotated[dict, Depends(verify_supabase_token)]  # JWT authentication required
+):
+    """Query specific order (with ownership verification)"""
     order = order_manager.get_order(order_number)
-    if order:
-        return order
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    
+    # Verify ownership
+    if order.get('user_id') != auth_data['user_id']:
+        raise HTTPException(status_code=403, detail="You don't have permission to access this order")
+    
+    return order
     return {"error": "Order not found"}
 
 

@@ -9,7 +9,7 @@ import json
 
 supabase: Client = create_client(
     os.getenv("SUPABASE_URL"),
-    os.getenv("SUPABASE_KEY")
+    os.getenv("SUPABASE_SERVICE_ROLE_KEY")  # Backend uses service role key
 )
 
 
@@ -112,8 +112,36 @@ class ConversationManager:
         user_id: Optional[str] = None,
         limit: int = 50
     ) -> List[Dict]:
-        """取得對話歷史（自動解密）"""
+        """
+        Get conversation history (with auto-decryption)
+        
+        Args:
+            session_id: Session ID to retrieve conversations for
+            decrypt: Whether to decrypt encrypted content
+            user_id: User ID for ownership verification (optional)
+            limit: Maximum number of messages to return
+        
+        Returns:
+            List of conversation messages
+        
+        Raises:
+            PermissionError: If user doesn't own the session
+        """
         try:
+            # Verify ownership if user_id is provided
+            if user_id:
+                session_data = self.supabase.table('sessions')\
+                    .select('user_id')\
+                    .eq('session_id', session_id)\
+                    .single()\
+                    .execute()
+                
+                if not session_data.data:
+                    raise ValueError(f"Session not found: {session_id}")
+                
+                if session_data.data.get('user_id') != user_id:
+                    raise PermissionError(f"User {user_id} doesn't have permission to access session {session_id}")
+            
             response = self.supabase.table('conversations')\
                 .select('*')\
                 .eq('session_id', session_id)\
@@ -128,27 +156,27 @@ class ConversationManager:
             
             for msg in response.data:
                 if decrypt and msg.get('content_encrypted'):
-                    # 解密內容
+                    # Decrypt content
                     try:
                         decrypted_content = self.encryption.decrypt(
                             msg['content_encrypted']
                         )
                         
-                        # 驗證完整性
+                        # Verify integrity
                         if msg.get('content_hash') and decrypted_content:
                             is_valid = self.encryption.verify_integrity(
                                 decrypted_content,
                                 msg['content_hash']
                             )
                             if not is_valid:
-                                print(f"⚠️  內容完整性驗證失敗: {msg['id']}")
+                                print(f"⚠️  Content integrity verification failed: {msg['id']}")
                         
                         msg['content'] = decrypted_content
                     except Exception as e:
-                        print(f"❌ 解密失敗: {e}")
-                        msg['content'] = "[解密失敗]"
+                        print(f"❌ Decryption failed: {e}")
+                        msg['content'] = "[Decryption failed]"
                     
-                    # 解密 tool arguments
+                    # Decrypt tool arguments
                     if msg.get('tool_arguments_encrypted'):
                         try:
                             msg['tool_arguments'] = self.encryption.decrypt_json(
@@ -157,7 +185,7 @@ class ConversationManager:
                         except:
                             pass
                     
-                    # 解密 tool result
+                    # Decrypt tool result
                     if msg.get('tool_result_encrypted'):
                         try:
                             msg['tool_result'] = self.encryption.decrypt_json(
@@ -298,6 +326,99 @@ class SessionManager:
         
         except Exception as e:
             print(f"❌ 結束 session 失敗: {e}")
+            return False
+    
+    def get_sessions_by_user(
+        self,
+        user_id: str,
+        limit: int = 50,
+        status: Optional[str] = None
+    ) -> List[Dict]:
+        """
+        Get all sessions for a specific user
+        
+        Args:
+            user_id: User ID (UUID)
+            limit: Maximum number of sessions to return
+            status: Filter by session status (active, completed, cancelled)
+        
+        Returns:
+            List of session dictionaries
+        """
+        try:
+            print(f"🔍 Querying sessions for user: {user_id}")
+            print(f"   Limit: {limit}, Status filter: {status}")
+            
+            query = self.supabase.table('sessions')\
+                .select('*')\
+                .eq('user_id', user_id)
+            
+            if status:
+                query = query.eq('status', status)
+            
+            response = query.order('last_activity_at', desc=True)\
+                .limit(limit)\
+                .execute()
+            
+            result = response.data if response.data else []
+            print(f"   ✅ Found {len(result)} sessions")
+            
+            return result
+        
+        except Exception as e:
+            print(f"❌ Query user sessions failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+    
+    def delete_session(
+        self,
+        session_id: str,
+        user_id: str
+    ) -> bool:
+        """
+        Delete session and all related conversations
+        
+        Args:
+            session_id: Session ID to delete
+            user_id: User ID for ownership verification
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # First verify ownership
+            session_data = self.supabase.table('sessions')\
+                .select('user_id')\
+                .eq('session_id', session_id)\
+                .single()\
+                .execute()
+            
+            if not session_data.data:
+                print(f"❌ Session not found: {session_id}")
+                return False
+            
+            if session_data.data.get('user_id') != user_id:
+                print(f"❌ Permission denied: User {user_id} cannot delete session {session_id}")
+                return False
+            
+            # Delete all conversations for this session
+            conv_response = self.supabase.table('conversations')\
+                .delete()\
+                .eq('session_id', session_id)\
+                .execute()
+            
+            # Delete the session
+            session_response = self.supabase.table('sessions')\
+                .delete()\
+                .eq('session_id', session_id)\
+                .execute()
+            
+            print(f"✅ Session deleted: {session_id}")
+            return True
+        
+        except Exception as e:
+            print(f"❌ Delete session failed: {e}")
             return False
 
 
