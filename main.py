@@ -775,13 +775,18 @@ For new order, say "new order"."""
 @app.post("/api/aws/credentials", response_model=CredentialsResponse)
 async def get_temporary_credentials():
     """
-    Generate AWS temporary credentials for Flutter App using AssumeRole
+    Generate AWS temporary credentials for Flutter App
     Valid for: 1 hour
+    
+    Note: This returns the main AWS credentials. In production, you should:
+    1. Create a dedicated IAM role with minimal Transcribe permissions
+    2. Use AssumeRole or GetFederationToken with that role
     """
     try:
         AWS_REGION = os.getenv("AWS_TRANSCRIBE_REGION", "ap-southeast-1")
         
-        # Create STS client
+        # For now, return session credentials using GetSessionToken
+        # This doesn't require special IAM permissions
         sts_client = boto3.client(
             'sts',
             aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
@@ -789,27 +794,8 @@ async def get_temporary_credentials():
             region_name=AWS_REGION
         )
         
-        # Define inline policy for Transcribe access
-        policy = {
-            "Version": "2012-10-17",
-            "Statement": [
-                {
-                    "Effect": "Allow",
-                    "Action": [
-                        "transcribe:StartStreamTranscription",
-                        "transcribe:StartStreamTranscriptionWebSocket"
-                    ],
-                    "Resource": "*"
-                }
-            ]
-        }
-        
-        # Use AssumeRole instead of GetFederationToken
-        # Replace 'YOUR_ROLE_ARN' with the actual role ARN you'll create
-        response = sts_client.assume_role(
-            RoleArn=os.getenv("AWS_TRANSCRIBE_ROLE_ARN"),  # Add this to .env
-            RoleSessionName='DentalAppSession',
-            Policy=json.dumps(policy),
+        # GetSessionToken works with regular IAM users
+        response = sts_client.get_session_token(
             DurationSeconds=3600  # 1 hour
         )
         
@@ -826,12 +812,17 @@ async def get_temporary_credentials():
     except ClientError as e:
         error_code = e.response['Error']['Code']
         error_message = e.response['Error']['Message']
+        print(f"❌ AWS STS Error [{error_code}]: {error_message}")
         
         raise HTTPException(
             status_code=500,
             detail=f"AWS STS Error [{error_code}]: {error_message}"
         )
     except Exception as e:
+        print(f"❌ Unexpected error in /api/aws/credentials: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        
         raise HTTPException(
             status_code=500,
             detail=f"Unexpected error: {str(e)}"
